@@ -316,7 +316,7 @@ If you use this work, please cite:
 ```bibtex
 @software{rdna4_quant_2026,
   title={rdna4-quant: INT4 Quantization Engine for AMD Radeon},
-  author={Janusz},
+  author={JohnTDI and Claude Opus},
   year={2026},
   url={https://github.com/johnTDI-cpu/rdna4-quant},
   note={First production INT4+Hadamard+GPTQ engine for consumer AMD GPUs}
