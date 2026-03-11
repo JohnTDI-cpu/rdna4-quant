@@ -103,7 +103,7 @@ Beats llama.cpp GGUF Q4_K_M on quality AND speed.
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/rdna4-quant.git
+git clone https://github.com/johnTDI-cpu/rdna4-quant.git
 cd rdna4-quant
 
 pip install -r requirements.txt
@@ -318,7 +318,7 @@ If you use this work, please cite:
   title={rdna4-quant: INT4 Quantization Engine for AMD Radeon},
   author={Janusz},
   year={2026},
-  url={https://github.com/YOUR_USERNAME/rdna4-quant},
+  url={https://github.com/johnTDI-cpu/rdna4-quant},
   note={First production INT4+Hadamard+GPTQ engine for consumer AMD GPUs}
 }
 ```

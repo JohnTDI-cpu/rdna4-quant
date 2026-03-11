@@ -4,12 +4,12 @@
 
 ## 1. GitHub (PIERWSZY KROK)
 
-Utwórz repo: `github.com/TWOJ_USERNAME/rdna4-quant`
+Utwórz repo: `github.com/johnTDI-cpu/rdna4-quant`
 
 ```bash
 cd "/home/janusz/AMD MXFP4"
 # Repo jest już zainicjalizowane, wystarczy:
-git remote add origin https://github.com/TWOJ_USERNAME/rdna4-quant.git
+git remote add origin https://github.com/johnTDI-cpu/rdna4-quant.git
 git push -u origin main
 ```
 
@@ -58,7 +58,7 @@ I built a custom INT4 quantization + inference engine from scratch for consumer 
 ## How to use
 
 ```bash
-git clone https://github.com/TWOJ_USERNAME/rdna4-quant
+git clone https://github.com/johnTDI-cpu/rdna4-quant
 cd rdna4-quant
 pip install -r requirements.txt
 cd hip_int4 && python setup.py build_ext --inplace && cd ..
@@ -82,7 +82,7 @@ python int4_engine_v5.py --chat
 - **RDNA4 WMMA lane mapping is undocumented** — we reverse-engineered it and documented it.
   See DISCOVERY_GFX12_WMMA_OUTPUT.md if you're writing GPU kernels for gfx12.
 
-**GitHub:** https://github.com/TWOJ_USERNAME/rdna4-quant
+**GitHub:** https://github.com/johnTDI-cpu/rdna4-quant
 
 Happy to answer questions. This is MIT licensed — use it however you want.
 ```
@@ -128,7 +128,7 @@ fused dequant and Fast Walsh-Hadamard Transform in registers.
 
 We also reverse-engineered the RDNA4 WMMA lane mapping (AMD doesn't document it).
 
-GitHub: https://github.com/TWOJ_USERNAME/rdna4-quant
+GitHub: https://github.com/johnTDI-cpu/rdna4-quant
 ```
 
 ---
@@ -156,7 +156,7 @@ Built a custom INT4 LLM engine for AMD Radeon RDNA4:
 PPL 7.69 (beats GGUF Q4_K_M)
 
 Custom HIP kernels + Hadamard rotation + GPTQ
-Open source: github.com/TWOJ_USERNAME/rdna4-quant
+Open source: github.com/johnTDI-cpu/rdna4-quant
 
 @AMDRadeon @ROCmSoftware
 ```
@@ -166,14 +166,14 @@ Open source: github.com/TWOJ_USERNAME/rdna4-quant
 ## 7. HuggingFace Model Card
 
 Upload skwantyzowanych wag jako model:
-- `TWOJ_USERNAME/Qwen3-14B-INT4-Hadamard-GPTQ`
+- `johnTDI-cpu/Qwen3-14B-INT4-Hadamard-GPTQ`
 - Model card z benchmarkami
 - Link do repozytorium
 
 ```bash
 # Upload za pomocą huggingface-cli:
 pip install huggingface_hub
-huggingface-cli upload TWOJ_USERNAME/Qwen3-14B-INT4-Hadamard-GPTQ ./quantized_v4_gptq/
+huggingface-cli upload johnTDI-cpu/Qwen3-14B-INT4-Hadamard-GPTQ ./quantized_v4_gptq/
 ```
 
 ---
