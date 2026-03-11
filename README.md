@@ -158,7 +158,11 @@ The quantized weights are portable: quantize once, run anywhere.
 ### Option B: Download pre-quantized weights
 
 ```bash
-# (Coming soon — HuggingFace model card)
+# Best quality — mixed INT4/INT8 (PPL 7.692, ~11 GB)
+huggingface-cli download JohnTdi/Qwen3-14B-INT4-Mixed-GPTQ --local-dir quantized_v4_gptq
+
+# Smaller — pure INT4 (PPL 7.787, ~9.2 GB)
+huggingface-cli download JohnTdi/Qwen3-14B-INT4-Pure-GPTQ --local-dir quantized_v5_pure_int4
 ```
 
 ### Run inference
