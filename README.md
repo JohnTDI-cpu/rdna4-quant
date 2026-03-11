@@ -1,9 +1,9 @@
 # rdna4-quant
 
-**First production INT4 quantization + inference engine for consumer AMD GPUs.**
+**INT4 quantization + inference engine for consumer AMD GPUs.**
 Beats llama.cpp GGUF Q4_K_M on quality AND speed.
 
-> Custom HIP kernels, Hadamard rotation, GPTQ calibration, FP8 KV cache — all running on a $600 AMD Radeon.
+> Custom HIP kernels, Hadamard rotation, GPTQ calibration, FP8 KV cache — all running on consumer AMD Radeon cards.
 
 ---
 
