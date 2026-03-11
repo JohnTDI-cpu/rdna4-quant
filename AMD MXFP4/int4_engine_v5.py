@@ -21,7 +21,20 @@ os.environ['PYTORCH_ROCM_ARCH'] = 'gfx1201'
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / 'hip_int4'))
 
-import int4_hip
+try:
+    import int4_hip
+except ImportError:
+    print("int4_hip not found — building JIT from hip_int4/int4_decode_step.hip ...")
+    from torch.utils.cpp_extension import load
+    hip_dir = Path(__file__).parent / 'hip_int4'
+    int4_hip = load(
+        name='int4_hip',
+        sources=[str(hip_dir / 'int4_decode_step.hip')],
+        extra_cuda_cflags=['-O3', '--offload-arch=gfx1201', '-std=c++17', '-Wno-unused-result'],
+        extra_cflags=['-O3', '-std=c++17'],
+        verbose=True,
+    )
+    print("JIT build complete.")
 from mxfp4_engine import RMSNorm, KVCache, precompute_rope_freqs, apply_rope
 from fused_ops import fused_rmsnorm
 import hadamard_utils

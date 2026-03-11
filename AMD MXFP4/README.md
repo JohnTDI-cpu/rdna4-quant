@@ -96,8 +96,10 @@ Beats llama.cpp GGUF Q4_K_M on quality AND speed.
 ### Requirements
 
 - AMD GPU with ROCm support (RDNA3: RX 7900 XTX, RDNA4: R9700/RX 9070 XT, or MI300X)
-- ROCm 6.x or 7.x
+- ROCm 6.x or 7.x (tested with ROCm 7.1.0)
+- PyTorch 2.10+ with ROCm support (`pip install torch --index-url https://download.pytorch.org/whl/rocm7.1`)
 - Python 3.10+
+- System packages: `rocm-dev`, `hipcc` (for compiling HIP kernels)
 - ~32 GB RAM for quantization, ~12 GB VRAM for inference
 
 ### Installation
@@ -108,8 +110,18 @@ cd rdna4-quant
 
 pip install -r requirements.txt
 
-# Build HIP decode kernels
+# Option 1: Pre-build HIP kernels (recommended)
 cd hip_int4 && python setup.py build_ext --inplace && cd ..
+
+# Option 2: JIT compilation (auto-builds on first run, no setup.py needed)
+# Just run int4_engine_v5.py — it will compile automatically if .so is missing
+```
+
+### Run tests
+
+```bash
+python tests/test_kernels.py
+# Expected: 6 passed, 0 failed
 ```
 
 ### Option A: Quantize from scratch (~30 min)
@@ -296,6 +308,23 @@ rdna4-quant/
 ├── quality_results_250.json           # ARC/MMLU benchmark results
 └── sensitivity_map.json               # Layer sensitivity rankings
 ```
+
+---
+
+## Known Limitations
+
+- **Qwen3 only**: Currently supports Qwen2/Qwen3 architecture. LLaMA/Mistral support requires a model config mapping (architectures are nearly identical — RMSNorm, RoPE, GQA — only tensor naming differs).
+- **Static KV cache**: Fixed-size allocation. No paged attention (vLLM-style). Works well up to ~8k context, but very long contexts (32k+) will need KV cache paging.
+- **Single GPU**: No tensor parallelism yet. Decode is bandwidth-limited at ~61 t/s on single R9700.
+- **VRAM**: Uses ~1.1 GB more than GGUF Q4_K_M due to FP16 scales (higher quality tradeoff).
+
+## Future Work
+
+- **Multi-model support**: Add LLaMA 3.x / Mistral config mapping (~90% code reuse)
+- **Tensor parallelism**: Split layers across 2 GPUs for ~2x decode speed
+- **Speculative decoding**: Use small draft model to generate candidates, verify in batch
+- **W4A4 WMMA prefill**: Use native `v_wmma_i32_16x16x32_iu4` for INT4xINT4 matrix multiply (RDNA4 supports 1557 TOPS INT4)
+- **KV cache paging**: Dynamic allocation for very long contexts (32k+)
 
 ---
 
