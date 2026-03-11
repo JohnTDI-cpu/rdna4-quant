@@ -1,0 +1,23 @@
+# Quantized weight directories (multi-GB each)
+quantized_*/
+
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# Compiled HIP extensions
+*.so
+
+# Data files
+wikitext-2-test.txt
+Qwen3.5-4B-GGUF/
+
+# OS / IDE
+.cache/
+.vscode/
+*.swp
+*~
+.DS_Store

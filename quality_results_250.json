@@ -1,0 +1,30 @@
+{
+  "int4v5": {
+    "arc_challenge": {
+      "acc": 0.928,
+      "n": 250
+    },
+    "hellaswag": {
+      "acc": 0.552,
+      "n": 250
+    },
+    "mmlu": {
+      "acc": 0.756,
+      "n": 250
+    }
+  },
+  "gguf": {
+    "arc_challenge": {
+      "acc": 0.908,
+      "n": 250
+    },
+    "hellaswag": {
+      "acc": 0.26,
+      "n": 250
+    },
+    "mmlu": {
+      "acc": 0.728,
+      "n": 250
+    }
+  }
+}
