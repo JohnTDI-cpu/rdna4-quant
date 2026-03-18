@@ -1598,6 +1598,96 @@ void wmma_int4_gemm_sym(
         row[n_start+96+nl]=__float2half(a6[j]);row[n_start+112+nl]=__float2half(a7[j]);}
 }
 
+// ============================================================
+// SWMMAC 2:4 Sparse INT4 GEMM — V_SWMMAC_I32_16X16X64_IU4
+// 477 TOPS raw throughput on R9700 (1.83× over dense WMMA)
+//
+// Index encoding (2-bit per group of 4 B elements):
+//   0 → pair (0,1), 1 → (0,2), 2 → (0,3), 3 → (1,2)
+//   Constraint: first non-zero must be at position 0 or 1
+//   short idx = 8 groups × 2 bits = 16 bits per K-half per lane
+//
+// A (sparse weights): v2i = 16 compressed non-zero nibbles per K-half
+// B (dense activations): v4i = 32 dense nibbles per K-half
+// ============================================================
+typedef int swmmac_v4i __attribute__((ext_vector_type(4)));
+
+template<int GS=64>
+__global__ __launch_bounds__(32, 4)
+void swmmac_int4_gemm(
+    const uint8_t* act_q,          // [M_pad, K/2] dense signed symmetric INT4
+    const float* act_scales,       // [M_pad, ng] per-group act scales
+    const uint8_t* wt_compressed,  // [N, K/4] compressed 2:4 weights (2 nibbles per group of 4)
+    const uint8_t* wt_index_raw,   // [N, K/4] raw 2-bit indices (to be packed into short)
+    const float* w_scales,         // [ng, N_pad] transposed weight scales
+    __half* output,
+    int M, int M_pad, int N_pad, int K)
+{
+    const int lane = threadIdx.x;
+    const int m_start = blockIdx.y * 16;
+    const int n_start = blockIdx.x * 64;
+    if (m_start >= M || n_start >= N_pad) return;
+    const int nl = lane % 16, kg = lane / 16;
+    const int ng = K / GS;
+    const int m_idx = m_start + nl;
+    const bool m_valid = (m_idx < M);
+
+    float a0[8]={},a1[8]={},a2[8]={},a3[8]={};
+
+    // K processed in groups of GS=64 (matching SWMMAC K=64)
+    for (int g = 0; g < ng; g++) {
+        int k = g * GS;
+
+        // Load B (dense activations) — v4i per lane
+        swmmac_v4i B;
+        if (m_valid) {
+            const uint8_t* aq = act_q + (int64_t)m_idx * (K/2) + k/2;
+            B = (swmmac_v4i){*(const int*)(aq + kg*16),
+                             *(const int*)(aq + kg*16 + 4),
+                             *(const int*)(aq + kg*16 + 8),
+                             *(const int*)(aq + kg*16 + 12)};
+        } else { B = {}; }
+
+        // Load A (compressed sparse) + build index — 4 N-tiles
+        #define LOAD_A_SPARSE(idx) wmma_int2 As##idx; short sidx##idx; \
+        { \
+            int n_row = n_start + idx*16 + nl; /* which weight row */ \
+            /* Compressed: [N, K/4]. Per K-group of 64: 16 bytes (64/4=16 groups × 1 byte) */ \
+            const uint8_t* sp = wt_compressed + (int64_t)n_row * (K/4) + k/4 + kg*8; \
+            As##idx = (wmma_int2){*(const int*)(sp), *(const int*)(sp+4)}; \
+            /* Index: [N, K/4]. Same layout. Pack 8 groups × 2 bits → short */ \
+            const uint8_t* si = wt_index_raw + (int64_t)n_row * (K/4) + k/4 + kg*8; \
+            /* Each byte has one 2-bit index (low bits). Pack 8 bytes → 16 bits */ \
+            uint16_t packed_idx = 0; \
+            for (int i = 0; i < 8; i++) packed_idx |= ((uint16_t)(si[i] & 3)) << (i*2); \
+            sidx##idx = (short)packed_idx; \
+        }
+        LOAD_A_SPARSE(0) LOAD_A_SPARSE(1) LOAD_A_SPARSE(2) LOAD_A_SPARSE(3)
+        #undef LOAD_A_SPARSE
+
+        // 4 SWMMAC — 2:4 sparse, signed
+        wmma_int8 R0={},R1={},R2={},R3={};
+        R0 = __builtin_amdgcn_swmmac_i32_16x16x64_iu4_w32(true, As0, true, B, R0, sidx0, false);
+        R1 = __builtin_amdgcn_swmmac_i32_16x16x64_iu4_w32(true, As1, true, B, R1, sidx1, false);
+        R2 = __builtin_amdgcn_swmmac_i32_16x16x64_iu4_w32(true, As2, true, B, R2, sidx2, false);
+        R3 = __builtin_amdgcn_swmmac_i32_16x16x64_iu4_w32(true, As3, true, B, R3, sidx3, false);
+
+        // Dequant: scale × signed_dot
+        float a_sc = m_valid ? act_scales[m_idx * ng + g] : 0.0f;
+        #define DEQUANT_SYM(idx) { \
+            float ws = w_scales[g * N_pad + n_start + idx*16 + nl]; \
+            float combined = ws * a_sc; \
+            for(int j=0;j<8;j++) a##idx[j] += combined * (float)R##idx[j];}
+        DEQUANT_SYM(0) DEQUANT_SYM(1) DEQUANT_SYM(2) DEQUANT_SYM(3)
+        #undef DEQUANT_SYM
+    }
+    // Store: column-distributed
+    for(int j=0;j<8;j++){int om=m_start+kg*8+j;if(om>=M)continue;
+        __half*row=output+(int64_t)om*N_pad;
+        row[n_start+nl]=__float2half(a0[j]);row[n_start+16+nl]=__float2half(a1[j]);
+        row[n_start+32+nl]=__float2half(a2[j]);row[n_start+48+nl]=__float2half(a3[j]);}
+}
+
 // Original asymmetric WMMA (kept for backward compatibility)
 template<int GS=32>
 __global__ __launch_bounds__(32, 8)

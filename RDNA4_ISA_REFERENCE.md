@@ -409,3 +409,54 @@ Optymalny flow z WMMA:
 | Memory dependency (S_WAIT) | 52-56 |
 | Microcode formats (VOP3P etc.) | 162-205 |
 | Full instruction reference | 206-697 |
+
+---
+
+## 17. SWMMAC 2:4 Sparsity — empiryczne odkrycia (2026-03-18)
+
+### V_SWMMAC_I32_16X16X64_IU4 na gfx1201
+
+Potwierdzone działanie! Raw throughput: **477 TOPS** (vs 261 TOPS dense WMMA = 1.83×).
+
+### Index format (częściowo zdekodowany)
+
+```
+Sygnatura: __builtin_amdgcn_swmmac_i32_16x16x64_iu4_w32(neg_a, A, neg_b, B, C, idx, clamp)
+  A: v2i (8 bytes) — compressed sparse weights (16 non-zero nibbles z 32 original)
+  B: v4i (16 bytes) — dense activations (32 nibbles)
+  C: v8i (32 bytes) — INT32 accumulator
+  idx: short (16 bits) — sparsity pattern index
+
+Per lane (kg = lane/16, nl = lane%16):
+  kg selects K-half: 0→first 32 K elements, 1→second 32 K elements
+  Each K-half: 32 elements → 8 groups of 4
+  idx encodes 2 bits per group → 16 bits total per lane
+```
+
+### Empiryczne wyniki
+
+```
+A = [1,1,0,...] (first group non-zero)
+B = [1,2,3,4,0,...] (first group has unique values)
+
+idx_bits=0: result=465 → selects B positions (0,1): 1*1 + 1*2 = 3
+idx_bits=1: result=466 → selects B positions (0,2): 1*1 + 1*3 = 4
+idx_bits=2: result=467 → selects B positions (0,3): 1*1 + 1*4 = 5
+idx_bits=3: result=468 → selects B positions (1,2): 1*2 + 1*3 = 5
+
+Mapping 2-bit → pair of positions:
+  0 → (0,1)
+  1 → (0,2)
+  2 → (0,3)
+  3 → (1,2)
+  
+Missing pairs: (1,3) and (2,3) — ISA constraint "idx0 < 2"
+```
+
+### Constraint
+
+Z ISA strony 96: pierwsza pozycja non-zero MUSI być w dolnej połowie grupy (pozycja 0 lub 1).
+To ogranicza 2:4 pattern do 4 z 6 możliwych kombinacji.
+
+Pruning musi respektować ten constraint: w każdej grupie 4, jedno z 2 zachowanych elementów 
+musi być na pozycji 0 lub 1. Nigdy nie może być (2,3) ani (1,3).
