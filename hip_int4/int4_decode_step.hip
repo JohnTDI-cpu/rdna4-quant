@@ -2299,8 +2299,7 @@ torch::Tensor prefill_moe_logits(
         auto* silu_p = reinterpret_cast<__half*>(silu_buf.data_ptr());
         auto* rot_silu_p = reinterpret_cast<__half*>(rot_silu_buf.data_ptr());
 
-        if (M <= 256) {
-            // Small M: W4A4 DOT8 — complete GU + SiLU + Had + DN
+        if (false) {  // W4A4 DISABLED — weights now in TILED format for WMMA
             int gu_groups = total_tok * (K_gu / 32);
             hipLaunchKernelGGL(quantize_activations_u4_v2,
                 dim3((gu_groups + 7) / 8), dim3(256), 0, stream,

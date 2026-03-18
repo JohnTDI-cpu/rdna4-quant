@@ -80,7 +80,7 @@ def _fp8e4m3_to_fp16(t: torch.Tensor) -> torch.Tensor:
 
 device = "cuda"
 quant_dir = Path(os.environ.get("QUANT_DIR",
-                 str(Path(__file__).parent / "quantized_moe_v2_g64")))
+                 str(Path(__file__).parent / "quantized_moe_tiled")))
 # Use FP16 attention from original model (fixes MoE router sensitivity to INT4 errors)
 USE_FP16_ATTN = os.environ.get("FP16_ATTN", "1") == "1"
 
@@ -269,13 +269,21 @@ for li in range(num_layers):
     hip_gate_w.append(ld['gate_weight'].half().to(device))
 
     # Stacked expert weights — keep contiguous on GPU
-    egu_packed = ld['exp_gu_packed'].to(device)
+    egu_packed = ld['exp_gu_packed']
+    # Handle both [E, N, K/2] (original) and [E, flat] (tiled) formats
+    if egu_packed.dim() == 2:
+        E_l = egu_packed.shape[0]
+        egu_packed = egu_packed.reshape(E_l, -1)  # keep flat for tiled WMMA
+    egu_packed = egu_packed.to(device)
     assert egu_packed.is_contiguous(), f"Layer {li} exp_gu_packed not contiguous!"
     hip_exp_gu_w.append(egu_packed)
     gu_sz = interleave_scale_zero_3d_rowmajor(ld['exp_gu_scales'].half(), ld['exp_gu_zeros'])
     hip_exp_gu_s.append(gu_sz.to(device))
 
-    edn_packed = ld['exp_dn_packed'].to(device)
+    edn_packed = ld['exp_dn_packed']
+    if edn_packed.dim() == 2:
+        edn_packed = edn_packed.reshape(edn_packed.shape[0], -1)
+    edn_packed = edn_packed.to(device)
     assert edn_packed.is_contiguous(), f"Layer {li} exp_dn_packed not contiguous!"
     hip_exp_dn_w.append(edn_packed)
     dn_sz = interleave_scale_zero_3d_rowmajor(ld['exp_dn_scales'].half(), ld['exp_dn_zeros'])

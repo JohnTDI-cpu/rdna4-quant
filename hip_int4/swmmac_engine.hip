@@ -422,7 +422,7 @@ __global__ __launch_bounds__(32, 4)  // 64N tile, 4 blocks/CU
 void wmma_expert_batched(
     const uint8_t* __restrict__ act_q,      // [total_tok, K/2] pre-quantized INT4
     const float* __restrict__ act_scales,    // [total_tok, ng]
-    const uint8_t* __restrict__ wt_base,    // [E, N, K/2] row-major packed
+    const uint8_t* __restrict__ wt_base,    // [E, K/8, N/16, 64] TILED per expert
     const __half* __restrict__ ws_base,     // [E, N, K/GS, 2] interleaved (scale, zero)
     __half* __restrict__ output,             // [total_tok, N]
     const int* __restrict__ expert_ids,      // [E] identity map (0,1,...,E-1)
@@ -466,12 +466,16 @@ void wmma_expert_batched(
                 a_sc = act_scales[m_idx * ng + g];
             } else { A = (_v2i){}; }
 
-            // Row-major weight load: W is [N, K/2] per expert
+            // TILED weight load: W is [K/8, N/16, 64] per expert
+            // COALESCED: 16 lanes × 4 bytes = 64 consecutive bytes = 1 cache line
+            int NB_w = ((N + 15) / 16);
             #define LOAD_W(ti) _v2i B##ti; { \
-                int n_row = n_start + ti*16 + nl; \
-                if (n_row < N) { \
-                    const uint8_t* wp = W + (int64_t)n_row * (K/2) + k/2 + kg*8; \
-                    B##ti = (_v2i){*(const int*)wp, *(const int*)(wp+4)}; \
+                int nb = n_start/16 + ti; \
+                int kc0 = k/8 + kg*2; \
+                if (nb*16+nl < N) { \
+                    B##ti = (_v2i){ \
+                        (int)*(const uint32_t*)(W + (int64_t)(kc0*NB_w+nb)*64 + nl*4), \
+                        (int)*(const uint32_t*)(W + (int64_t)((kc0+1)*NB_w+nb)*64 + nl*4)}; \
                 } else { B##ti = (_v2i){}; } }
             LOAD_W(0) LOAD_W(1) LOAD_W(2) LOAD_W(3)
             #undef LOAD_W
