@@ -418,7 +418,7 @@ void wmma_gemm_tiled(
 //    Quantizes activations to signed symmetric INT4 on-the-fly.
 // ================================================================
 template<int GS = 64>
-__global__ __launch_bounds__(32, 4)
+__global__ __launch_bounds__(32, 4)  // 64N tile, 4 blocks/CU
 void wmma_expert_batched(
     const uint8_t* __restrict__ act_q,      // [total_tok, K/2] pre-quantized INT4
     const float* __restrict__ act_scales,    // [total_tok, ng]
@@ -446,10 +446,9 @@ void wmma_expert_batched(
 
     const int lane = threadIdx.x;
     const int nl = lane % 16, kg = lane / 16;
-    const int n_start = blockIdx.x * 64;
+    const int n_start = blockIdx.x * 64;  // 64N per block (4 WMMA)
     if (n_start >= N) return;
 
-    // Process tokens in M-tiles of 16
     for (int m0 = 0; m0 < M_j; m0 += 16) {
         int m_end = min(m0 + 16, M_j);
         int m_idx = x_off + m0 + nl;
@@ -460,17 +459,13 @@ void wmma_expert_batched(
         for (int g = 0; g < ng; g++) {
             int k = g * GS;
 
-            // Load A (activations — already quantized)
-            _v2i A;
-            float a_sc = 0.0f;
+            _v2i A; float a_sc = 0.0f;
             if (m_valid) {
                 const uint8_t* aq = act_q + (int64_t)m_idx * (K/2) + k/2 + kg * 8;
                 A = (_v2i){*(const int*)aq, *(const int*)(aq + 4)};
                 a_sc = act_scales[m_idx * ng + g];
             } else { A = (_v2i){}; }
 
-            // Load B (weights — row-major per expert, not tiled)
-            // Each lane reads from row (n_start + ti*16 + nl) of this expert's weights
             #define LOAD_W(ti) _v2i B##ti; { \
                 int n_row = n_start + ti*16 + nl; \
                 if (n_row < N) { \
@@ -480,15 +475,12 @@ void wmma_expert_batched(
             LOAD_W(0) LOAD_W(1) LOAD_W(2) LOAD_W(3)
             #undef LOAD_W
 
-            // 4 dense WMMA
             _v8i R0={}, R1={}, R2={}, R3={};
-            R0 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, A, true, B0, R0, false);
-            R1 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, A, true, B1, R1, false);
-            R2 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, A, true, B2, R2, false);
-            R3 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, A, true, B3, R3, false);
+            R0=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B0,R0,false);
+            R1=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B1,R1,false);
+            R2=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B2,R2,false);
+            R3=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B3,R3,false);
 
-            // Dequant — read from [N, K/GS, 2] interleaved (scale at offset 0, zero at 1)
-            // For symmetric: zero≈0, so just use scale
             #define DEQUANT(ti) { \
                 int n_row = n_start + ti*16 + nl; \
                 float ws = (n_row < N) ? __half2float(WS[((int64_t)n_row * ng + g) * 2]) : 0.0f; \
@@ -498,16 +490,15 @@ void wmma_expert_batched(
             #undef DEQUANT
         }
 
-        // Store
         for (int j = 0; j < 8; j++) {
             int om = m0 + kg * 8 + j;
             if (om >= m_end) continue;
             int out_row = x_off + om;
             __half* row = output + (int64_t)out_row * N;
-            if (n_start + nl < N)      row[n_start + nl]      = __float2half(acc0[j]);
-            if (n_start+16+nl < N)     row[n_start + 16 + nl] = __float2half(acc1[j]);
-            if (n_start+32+nl < N)     row[n_start + 32 + nl] = __float2half(acc2[j]);
-            if (n_start+48+nl < N)     row[n_start + 48 + nl] = __float2half(acc3[j]);
+            if (n_start+nl<N)    row[n_start+nl]=__float2half(acc0[j]);
+            if (n_start+16+nl<N) row[n_start+16+nl]=__float2half(acc1[j]);
+            if (n_start+32+nl<N) row[n_start+32+nl]=__float2half(acc2[j]);
+            if (n_start+48+nl<N) row[n_start+48+nl]=__float2half(acc3[j]);
         }
     }
 }
