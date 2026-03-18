@@ -2041,12 +2041,15 @@ torch::Tensor prefill_moe_logits(
     // LM head dequant buffer
     auto lm_w_tmp = torch::empty({(long)lm_N * lm_K}, opts);
 
-    // W4A4 buffers: quantized activations for all-experts dispatch
+    // Activation quantization buffers
     auto opts_u8 = torch::dtype(torch::kUInt8).device(device);
     auto xq_gu_buf = torch::empty({(long)total_dispatch, (long)(K_gu / 2)}, opts_u8);
-    auto xq_gu_sc  = torch::empty({(long)total_dispatch, (long)(K_gu / 32), 2L}, opts);
+    auto xq_gu_sc  = torch::empty({(long)total_dispatch, (long)(K_gu / 32), 2L}, opts);  // FP16 for W4A4
     auto xq_dn_buf = torch::empty({(long)total_dispatch, (long)(K_dn / 2)}, opts_u8);
-    auto xq_dn_sc  = torch::empty({(long)total_dispatch, (long)(K_dn / 32), 2L}, opts);
+    auto xq_dn_sc  = torch::empty({(long)total_dispatch, (long)(K_dn / 32), 2L}, opts);  // FP16 for W4A4
+    // WMMA uses separate float32 scale buffer (allocated on demand)
+    auto wmma_gu_sc = torch::empty({(long)total_dispatch, (long)(K_gu / 32)}, opts_f);
+    auto wmma_dn_sc = torch::empty({(long)total_dispatch, (long)(K_dn / 32)}, opts_f);
 
     // INT4 attention dequant buffer (used when FP16 not available)
     int max_attn_N = use_fp16_attn ? 0 : qkv_dim;
@@ -2294,8 +2297,8 @@ torch::Tensor prefill_moe_logits(
         auto* silu_p = reinterpret_cast<__half*>(silu_buf.data_ptr());
         auto* rot_silu_p = reinterpret_cast<__half*>(rot_silu_buf.data_ptr());
 
-        if (M <= 1024) {  // W4A4: no CPU-GPU sync, 2 kernels per GU/DN
-            // W4A4 all-experts dispatch — ZERO CPU-GPU sync, 2 kernel launches total
+        if (M <= 256) {
+            // Small M: W4A4 DOT8 (low overhead, no WMMA padding waste)
             int gu_groups = total_tok * (K_gu / 32);
             hipLaunchKernelGGL(quantize_activations_u4_v2,
                 dim3((gu_groups + 7) / 8), dim3(256), 0, stream,
@@ -2303,12 +2306,30 @@ torch::Tensor prefill_moe_logits(
                 reinterpret_cast<uint8_t*>(xq_gu_buf.data_ptr()),
                 reinterpret_cast<__half*>(xq_gu_sc.data_ptr()),
                 total_tok, K_gu);
-
             constexpr int BN = 4, BM = 8;
             hipLaunchKernelGGL((gemv_w4a4_udot8_v3<BN, BM>),
                 dim3((N_gu + BN - 1) / BN, E), dim3(32), 0, stream,
                 reinterpret_cast<const uint8_t*>(xq_gu_buf.data_ptr()),
                 reinterpret_cast<const __half*>(xq_gu_sc.data_ptr()),
+                exp_gu_w[li].data_ptr<uint8_t>(),
+                reinterpret_cast<const __half*>(exp_gu_s[li].data_ptr()),
+                gu_out_p, eid_all_p, moff_p, mcnt_p,
+                gu_packed_stride, gu_scales_stride, N_gu, K_gu);
+        } else if (M <= 1024) {  // WMMA batched expert dispatch — zero CPU sync, best for M=512-1024
+            // Quantize activations to signed symmetric INT4
+            int gu_ng = K_gu / 32;
+            hipLaunchKernelGGL(swmmac_quantize_act,
+                dim3(gu_ng, ((total_tok + 15) / 16) * 16), dim3(32), 0, stream,
+                reinterpret_cast<const __half*>(xg_p),
+                reinterpret_cast<uint8_t*>(xq_gu_buf.data_ptr()),
+                wmma_gu_sc.data_ptr<float>(),
+                total_tok, K_gu, 32);
+
+            // WMMA expert batched GEMM — all 128 experts, zero sync
+            hipLaunchKernelGGL((wmma_expert_batched<64>),
+                dim3((N_gu + 63) / 64, E), dim3(32), 0, stream,
+                reinterpret_cast<const uint8_t*>(xq_gu_buf.data_ptr()),
+                wmma_gu_sc.data_ptr<float>(),
                 exp_gu_w[li].data_ptr<uint8_t>(),
                 reinterpret_cast<const __half*>(exp_gu_s[li].data_ptr()),
                 gu_out_p, eid_all_p, moff_p, mcnt_p,
@@ -2328,18 +2349,19 @@ torch::Tensor prefill_moe_logits(
 
             MOE_RECORD(5);
 
-            int dn_groups = total_tok * (K_dn / 32);
-            hipLaunchKernelGGL(quantize_activations_u4_v2,
-                dim3((dn_groups + 7) / 8), dim3(256), 0, stream,
-                rot_silu_p,
+            // DN WMMA expert batched GEMM
+            int dn_ng = K_dn / 32;
+            hipLaunchKernelGGL(swmmac_quantize_act,
+                dim3(dn_ng, ((total_tok + 15) / 16) * 16), dim3(32), 0, stream,
+                reinterpret_cast<const __half*>(rot_silu_p),
                 reinterpret_cast<uint8_t*>(xq_dn_buf.data_ptr()),
-                reinterpret_cast<__half*>(xq_dn_sc.data_ptr()),
-                total_tok, K_dn);
+                wmma_dn_sc.data_ptr<float>(),
+                total_tok, K_dn, 32);
 
-            hipLaunchKernelGGL((gemv_w4a4_udot8_v3<BN, BM>),
-                dim3((N_dn + BN - 1) / BN, E), dim3(32), 0, stream,
+            hipLaunchKernelGGL((wmma_expert_batched<64>),
+                dim3((N_dn + 63) / 64, E), dim3(32), 0, stream,
                 reinterpret_cast<const uint8_t*>(xq_dn_buf.data_ptr()),
-                reinterpret_cast<const __half*>(xq_dn_sc.data_ptr()),
+                wmma_dn_sc.data_ptr<float>(),
                 exp_dn_w[li].data_ptr<uint8_t>(),
                 reinterpret_cast<const __half*>(exp_dn_s[li].data_ptr()),
                 dn_out_p, eid_all_p, moff_p, mcnt_p,

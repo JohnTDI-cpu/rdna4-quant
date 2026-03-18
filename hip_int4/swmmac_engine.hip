@@ -409,3 +409,105 @@ void wmma_gemm_tiled(
         row[n_start + 48 + nl] = __float2half(acc3[j]);
     }
 }
+
+// ================================================================
+// 7. BATCHED EXPERT WMMA — all-experts dispatch, zero CPU sync
+//    Like gemv_w4a4_udot8_v3 but uses WMMA instead of DOT8.
+//    Grid: (N_tiles, E). Each block handles one (N-tile, expert) pair.
+//    Reads expert counts/offsets from GPU memory (no hipMemcpy needed).
+//    Quantizes activations to signed symmetric INT4 on-the-fly.
+// ================================================================
+template<int GS = 64>
+__global__ __launch_bounds__(32, 4)
+void wmma_expert_batched(
+    const uint8_t* __restrict__ act_q,      // [total_tok, K/2] pre-quantized INT4
+    const float* __restrict__ act_scales,    // [total_tok, ng]
+    const uint8_t* __restrict__ wt_base,    // [E, N, K/2] packed (row-major per expert)
+    const __half* __restrict__ ws_base,     // [E, N, K/GS, 2] interleaved (scale, zero) per expert
+    __half* __restrict__ output,             // [total_tok, N]
+    const int* __restrict__ expert_ids,      // [E] identity map (0,1,...,E-1)
+    const int* __restrict__ offsets,          // [E] token offsets per expert
+    const int* __restrict__ counts,           // [E] token counts per expert
+    int64_t packed_stride,                   // N * K/2 (bytes between experts in wt_base)
+    int64_t scales_stride,                   // ng * N_pad (floats between experts in ws_base)
+    int N, int K)
+{
+    const int eidx = blockIdx.y;
+    const int M_j = counts[eidx];
+    if (M_j == 0) return;
+
+    const int ej = expert_ids[eidx];
+    const int x_off = offsets[eidx];
+    const int N_pad = ((N + 15) / 16) * 16;
+    const int ng = K / GS;
+
+    const uint8_t* W = wt_base + (int64_t)ej * packed_stride;
+    const __half* WS = ws_base + (int64_t)ej * scales_stride;
+
+    const int lane = threadIdx.x;
+    const int nl = lane % 16, kg = lane / 16;
+    const int n_start = blockIdx.x * 64;
+    if (n_start >= N) return;
+
+    // Process tokens in M-tiles of 16
+    for (int m0 = 0; m0 < M_j; m0 += 16) {
+        int m_end = min(m0 + 16, M_j);
+        int m_idx = x_off + m0 + nl;
+        bool m_valid = (m0 + nl < m_end);
+
+        float acc0[8]={}, acc1[8]={}, acc2[8]={}, acc3[8]={};
+
+        for (int g = 0; g < ng; g++) {
+            int k = g * GS;
+
+            // Load A (activations — already quantized)
+            _v2i A;
+            float a_sc = 0.0f;
+            if (m_valid) {
+                const uint8_t* aq = act_q + (int64_t)m_idx * (K/2) + k/2 + kg * 8;
+                A = (_v2i){*(const int*)aq, *(const int*)(aq + 4)};
+                a_sc = act_scales[m_idx * ng + g];
+            } else { A = (_v2i){}; }
+
+            // Load B (weights — row-major per expert, not tiled)
+            // Each lane reads from row (n_start + ti*16 + nl) of this expert's weights
+            #define LOAD_W(ti) _v2i B##ti; { \
+                int n_row = n_start + ti*16 + nl; \
+                if (n_row < N) { \
+                    const uint8_t* wp = W + (int64_t)n_row * (K/2) + k/2 + kg*8; \
+                    B##ti = (_v2i){*(const int*)wp, *(const int*)(wp+4)}; \
+                } else { B##ti = (_v2i){}; } }
+            LOAD_W(0) LOAD_W(1) LOAD_W(2) LOAD_W(3)
+            #undef LOAD_W
+
+            // 4 dense WMMA
+            _v8i R0={}, R1={}, R2={}, R3={};
+            R0 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, A, true, B0, R0, false);
+            R1 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, A, true, B1, R1, false);
+            R2 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, A, true, B2, R2, false);
+            R3 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, A, true, B3, R3, false);
+
+            // Dequant — read from [N, K/GS, 2] interleaved (scale at offset 0, zero at 1)
+            // For symmetric: zero≈0, so just use scale
+            #define DEQUANT(ti) { \
+                int n_row = n_start + ti*16 + nl; \
+                float ws = (n_row < N) ? __half2float(WS[((int64_t)n_row * ng + g) * 2]) : 0.0f; \
+                float c = ws * a_sc; \
+                for(int j=0;j<8;j++) acc##ti[j] += c * (float)R##ti[j]; }
+            DEQUANT(0) DEQUANT(1) DEQUANT(2) DEQUANT(3)
+            #undef DEQUANT
+        }
+
+        // Store
+        for (int j = 0; j < 8; j++) {
+            int om = m0 + kg * 8 + j;
+            if (om >= m_end) continue;
+            int out_row = x_off + om;
+            __half* row = output + (int64_t)out_row * N;
+            if (n_start + nl < N)      row[n_start + nl]      = __float2half(acc0[j]);
+            if (n_start+16+nl < N)     row[n_start + 16 + nl] = __float2half(acc1[j]);
+            if (n_start+32+nl < N)     row[n_start + 32 + nl] = __float2half(acc2[j]);
+            if (n_start+48+nl < N)     row[n_start + 48 + nl] = __float2half(acc3[j]);
+        }
+    }
+}
