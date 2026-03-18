@@ -1530,7 +1530,7 @@ __global__ void wmma_quantize_act_sym(
 // No LDS, no barriers. Each warp independently loads A + B from VRAM.
 // B loads benefit from L0/L1 cache when multiple blocks share same N-tile.
 template<int GS=32>
-__global__ __launch_bounds__(32, 8)  // 1 warp, 8 blocks/CU — max occupancy for latency hiding
+__global__ __launch_bounds__(32, 2)  // 1 warp, 2 blocks/CU — 128N tile, ~92 VGPRs
 void wmma_int4_gemm_sym(
     const uint8_t* act_q, const float* act_scales,
     const uint8_t* wt, const float* w_scales,
@@ -1538,17 +1538,20 @@ void wmma_int4_gemm_sym(
 {
     const int lane = threadIdx.x;
     const int m_start = blockIdx.y * 16;
-    const int n_start = blockIdx.x * 64;
-    if (m_start >= M) return;
+    const int n_start = blockIdx.x * 128;  // 128N per block (8 WMMA per K-group)
+    if (m_start >= M || n_start >= N_pad) return;
     const int nl = lane % 16, kg = lane / 16, NB = N_pad / 16, ng = K / GS;
     const int m_idx = m_start + nl;
     const bool m_valid = (m_idx < M);
 
+    // 8 N-tile accumulators (128 output columns per block)
     float a0[8]={},a1[8]={},a2[8]={},a3[8]={};
+    float a4[8]={},a5[8]={},a6[8]={},a7[8]={};
+
     for (int g = 0; g < ng; g++) {
         int k = g * GS;
 
-        // Load A
+        // Load A once, reuse for 8 WMMA
         wmma_int2 A; float a_sc = 0.0f;
         if (m_valid) {
             const uint8_t* aq = act_q + (int64_t)m_idx * (K/2) + k/2 + kg * 8;
@@ -1556,35 +1559,43 @@ void wmma_int4_gemm_sym(
             a_sc = act_scales[m_idx * ng + g];
         } else { A = {}; }
 
-        // Load B directly (L0/L1 cached when multiple blocks access same N-tile)
+        // Load 8 B tiles (128N = 8 × 16N)
         #define LOAD_B(idx) wmma_int2 B##idx; \
-            {int nb=n_start/16+idx;int kc0=k/8+kg*2,kc1=kc0+1; \
+            {int nb=n_start/16+idx;int kc0=k/8+kg*2; \
              B##idx=(wmma_int2){ \
                 (int)*(const uint32_t*)(wt+(int64_t)(kc0*NB+nb)*64+nl*4), \
-                (int)*(const uint32_t*)(wt+(int64_t)(kc1*NB+nb)*64+nl*4)};}
+                (int)*(const uint32_t*)(wt+(int64_t)((kc0+1)*NB+nb)*64+nl*4)};}
         LOAD_B(0) LOAD_B(1) LOAD_B(2) LOAD_B(3)
+        LOAD_B(4) LOAD_B(5) LOAD_B(6) LOAD_B(7)
         #undef LOAD_B
 
-        // 4 WMMA — SIGNED, zero correction
-        wmma_int8 R0={},R1={},R2={},R3={};
+        // 8 WMMA — 2× more compute per memory load cycle
+        wmma_int8 R0={},R1={},R2={},R3={},R4={},R5={},R6={},R7={};
         R0=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B0,R0,false);
         R1=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B1,R1,false);
         R2=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B2,R2,false);
         R3=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B3,R3,false);
+        R4=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B4,R4,false);
+        R5=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B5,R5,false);
+        R6=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B6,R6,false);
+        R7=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B7,R7,false);
 
-        // Minimal dequant: scale × signed_dot
+        // Dequant (8 tiles)
         #define DEQUANT_SYM(idx) { \
             float ws = w_scales[g * N_pad + n_start + idx*16 + nl]; \
             float combined = ws * a_sc; \
             for(int j=0;j<8;j++) a##idx[j] += combined * (float)R##idx[j];}
         DEQUANT_SYM(0) DEQUANT_SYM(1) DEQUANT_SYM(2) DEQUANT_SYM(3)
+        DEQUANT_SYM(4) DEQUANT_SYM(5) DEQUANT_SYM(6) DEQUANT_SYM(7)
         #undef DEQUANT_SYM
     }
-    // Store: column-distributed
+    // Store: column-distributed (8 N-tiles = 128 columns)
     for(int j=0;j<8;j++){int om=m_start+kg*8+j;if(om>=M)continue;
         __half*row=output+(int64_t)om*N_pad;
         row[n_start+nl]=__float2half(a0[j]);row[n_start+16+nl]=__float2half(a1[j]);
-        row[n_start+32+nl]=__float2half(a2[j]);row[n_start+48+nl]=__float2half(a3[j]);}
+        row[n_start+32+nl]=__float2half(a2[j]);row[n_start+48+nl]=__float2half(a3[j]);
+        row[n_start+64+nl]=__float2half(a4[j]);row[n_start+80+nl]=__float2half(a5[j]);
+        row[n_start+96+nl]=__float2half(a6[j]);row[n_start+112+nl]=__float2half(a7[j]);}
 }
 
 // Original asymmetric WMMA (kept for backward compatibility)
@@ -5391,8 +5402,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             reinterpret_cast<const __half*>(input.data_ptr()),
             act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(), M, K, M_pad);
 
-        // WMMA GEMM — 1-warp symmetric, 16M×64N per block, max occupancy
-        dim3 grid((N_pad + 63) / 64, (M + 15) / 16);
+        // WMMA GEMM — 1-warp symmetric, 16M×128N per block
+        dim3 grid((N_pad + 127) / 128, (M + 15) / 16);
         if (group_size == 64) {
             hipLaunchKernelGGL((wmma_int4_gemm_sym<64>), grid, dim3(32), 0, stream,
                 act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(),
