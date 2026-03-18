@@ -2,7 +2,7 @@
  * INT4 Decode Step V2 — Production-only extract
  * MoE decode (graph + non-graph) + prefill, no debug/coop/hybrid code.
  */
-#include "swmmac_gemm.hip"  // SWMMAC/WMMA INT4 GEMM kernels
+#include "swmmac_engine.hip"  // Native RDNA4 SWMMAC/WMMA INT4 engine
 
 #include <hip/hip_runtime.h>
 #include <chrono>
@@ -5533,13 +5533,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // SWMMAC GEMM
         dim3 grid((N_pad + 63) / 64, (M + 15) / 16);
         if (group_size == 64) {
-            hipLaunchKernelGGL((swmmac_gemm_kernel<64>), grid, dim3(32), 0, stream,
+            hipLaunchKernelGGL((swmmac_gemm_tiled<64>), grid, dim3(32), 0, stream,
                 act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(),
                 wt_sparse.data_ptr<uint8_t>(), wt_index.data_ptr<short>(),
                 w_scales.data_ptr<float>(),
                 reinterpret_cast<__half*>(output.data_ptr()), M, (int)N_pad, (int)K);
         } else {
-            hipLaunchKernelGGL((swmmac_gemm_kernel<32>), grid, dim3(32), 0, stream,
+            hipLaunchKernelGGL((swmmac_gemm_tiled<32>), grid, dim3(32), 0, stream,
                 act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(),
                 wt_sparse.data_ptr<uint8_t>(), wt_index.data_ptr<short>(),
                 w_scales.data_ptr<float>(),
@@ -5568,7 +5568,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(), M, K, (int)group_size);
 
         dim3 grid((N_pad + 63) / 64, (M + 15) / 16);
-        hipLaunchKernelGGL((wmma_dense_gemm_kernel<(int)64>), grid, dim3(32), 0, stream,
+        hipLaunchKernelGGL((wmma_gemm_tiled<(int)64>), grid, dim3(32), 0, stream,
             act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(),
             wt_tiled.data_ptr<uint8_t>(), w_scales.data_ptr<float>(),
             reinterpret_cast<__half*>(output.data_ptr()), M, (int)N_pad, (int)K);
