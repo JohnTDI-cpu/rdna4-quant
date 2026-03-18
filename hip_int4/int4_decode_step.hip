@@ -1526,34 +1526,37 @@ __global__ void wmma_quantize_act_sym(
     if (tid == 0) act_scales[m * (K/32) + g] = scale;
 }
 
-// WMMA INT4 GEMM — SIGNED SYMMETRIC variant: ZERO scale correction in inner loop!
-// Weights: signed symmetric (stored unsigned+8, WMMA neg=true → signed -8..+7)
-// Activations: signed symmetric (same scheme)
-// Inner loop: pure WMMA accumulation. Dequant = scale_w * scale_a * raw_dot (ONCE at end per group)
+// WMMA INT4 GEMM — SIGNED SYMMETRIC, 1 warp per block, high occupancy
+// No LDS, no barriers. Each warp independently loads A + B from VRAM.
+// B loads benefit from L0/L1 cache when multiple blocks share same N-tile.
 template<int GS=32>
-__global__ __launch_bounds__(32, 8)
+__global__ __launch_bounds__(32, 8)  // 1 warp, 8 blocks/CU — max occupancy for latency hiding
 void wmma_int4_gemm_sym(
-    const uint8_t* act_q, const float* act_scales,  // [M, K/GS] per-group act scales
-    const uint8_t* wt, const float* w_scales,        // [ng, N] per-group weight scales (transposed)
+    const uint8_t* act_q, const float* act_scales,
+    const uint8_t* wt, const float* w_scales,
     __half* output, int M, int M_pad, int N_pad, int K)
 {
-    const int lane=threadIdx.x, m_start=blockIdx.y*16, n_start=blockIdx.x*64;
-    if(m_start>=M) return;
-    const int nl=lane%16, kg=lane/16, NB=N_pad/16, ng=K/GS;
-    const int m_idx=m_start+nl;
-    const bool m_valid=(m_idx<M);
+    const int lane = threadIdx.x;
+    const int m_start = blockIdx.y * 16;
+    const int n_start = blockIdx.x * 64;
+    if (m_start >= M) return;
+    const int nl = lane % 16, kg = lane / 16, NB = N_pad / 16, ng = K / GS;
+    const int m_idx = m_start + nl;
+    const bool m_valid = (m_idx < M);
+
     float a0[8]={},a1[8]={},a2[8]={},a3[8]={};
-    for(int g=0;g<ng;g++){
-        int k=g*GS;
-        // Load activation tile (signed symmetric: stored unsigned, WMMA neg=true)
-        wmma_int2 A;
-        float a_sc = 0.0f;
-        if(m_valid){
-            const uint8_t*aq=act_q+(int64_t)m_idx*(K/2)+k/2+kg*8;
-            A=(wmma_int2){*(const int*)(aq),*(const int*)(aq+4)};
+    for (int g = 0; g < ng; g++) {
+        int k = g * GS;
+
+        // Load A
+        wmma_int2 A; float a_sc = 0.0f;
+        if (m_valid) {
+            const uint8_t* aq = act_q + (int64_t)m_idx * (K/2) + k/2 + kg * 8;
+            A = (wmma_int2){*(const int*)(aq), *(const int*)(aq + 4)};
             a_sc = act_scales[m_idx * ng + g];
-        }else{A={};}
-        // Load 4 weight tiles
+        } else { A = {}; }
+
+        // Load B directly (L0/L1 cached when multiple blocks access same N-tile)
         #define LOAD_B(idx) wmma_int2 B##idx; \
             {int nb=n_start/16+idx;int kc0=k/8+kg*2,kc1=kc0+1; \
              B##idx=(wmma_int2){ \
@@ -1561,14 +1564,15 @@ void wmma_int4_gemm_sym(
                 (int)*(const uint32_t*)(wt+(int64_t)(kc1*NB+nb)*64+nl*4)};}
         LOAD_B(0) LOAD_B(1) LOAD_B(2) LOAD_B(3)
         #undef LOAD_B
-        // 4 WMMA with SIGNED inputs (neg_a=true, neg_b=true)
-        // ZERO correction between WMMAs!
+
+        // 4 WMMA — SIGNED, zero correction
         wmma_int8 R0={},R1={},R2={},R3={};
         R0=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B0,R0,false);
         R1=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B1,R1,false);
         R2=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B2,R2,false);
         R3=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true,A,true,B3,R3,false);
-        // Dequant: acc += w_scale * a_scale * signed_dot (MINIMAL: 1 mul + 1 FMA per element)
+
+        // Minimal dequant: scale × signed_dot
         #define DEQUANT_SYM(idx) { \
             float ws = w_scales[g * N_pad + n_start + idx*16 + nl]; \
             float combined = ws * a_sc; \
@@ -1576,7 +1580,7 @@ void wmma_int4_gemm_sym(
         DEQUANT_SYM(0) DEQUANT_SYM(1) DEQUANT_SYM(2) DEQUANT_SYM(3)
         #undef DEQUANT_SYM
     }
-    // Store: column-distributed (lane%16=col, (lane/16)*8+j=row)
+    // Store: column-distributed
     for(int j=0;j<8;j++){int om=m_start+kg*8+j;if(om>=M)continue;
         __half*row=output+(int64_t)om*N_pad;
         row[n_start+nl]=__float2half(a0[j]);row[n_start+16+nl]=__float2half(a1[j]);
@@ -5387,7 +5391,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             reinterpret_cast<const __half*>(input.data_ptr()),
             act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(), M, K, M_pad);
 
-        // WMMA GEMM — symmetric, zero correction
+        // WMMA GEMM — 1-warp symmetric, 16M×64N per block, max occupancy
         dim3 grid((N_pad + 63) / 64, (M + 15) / 16);
         if (group_size == 64) {
             hipLaunchKernelGGL((wmma_int4_gemm_sym<64>), grid, dim3(32), 0, stream,
