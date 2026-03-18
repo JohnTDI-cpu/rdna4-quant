@@ -1,26 +1,29 @@
 # rdna4-quant
 
 **INT4 quantization + inference engine for consumer AMD GPUs.**
-Beats llama.cpp GGUF Q4_K_M on quality AND speed.
 
-> Custom HIP kernels, Hadamard rotation, GPTQ calibration, FP8 KV cache — all running on consumer AMD Radeon cards.
+> Custom HIP kernels, Hadamard rotation, GPTQ calibration — all running on consumer AMD Radeon cards.
 
 ---
 
 ## Key Results
 
-**Model:** Qwen3-14B (14.7B params) | **GPU:** AMD Radeon AI PRO R9700 (RDNA4, 32GB)
+**GPU:** AMD Radeon AI PRO R9700 (RDNA4, gfx1201, 32 GB, 576 GB/s)
 
-### Speed
+### Qwen3-14B (Dense, 40 layers)
 
-| Metric | rdna4-quant | llama.cpp Q4_K_M | Difference |
+Comparison with llama.cpp Q4_K_M **ROCm** backend on the same GPU.
+
+#### Speed
+
+| Metric | rdna4-quant | llama.cpp Q4_K_M (ROCm) | Difference |
 |---|---|---|---|
 | Decode (ctx=128) | **61 t/s** | 47.7 t/s | **+28%** |
 | Decode (ctx=2048) | **57.5 t/s** | 41.0 t/s | **+40%** |
 | Prefill (pp512) | **2,076 t/s** | 559 t/s | **3.7x faster** |
 | Context scaling (128->2048) | **-6%** | -14% | 2.3x less degradation |
 
-### Quality
+#### Quality
 
 | Benchmark | rdna4-quant | llama.cpp Q4_K_M | Difference |
 |---|---|---|---|
@@ -28,13 +31,43 @@ Beats llama.cpp GGUF Q4_K_M on quality AND speed.
 | ARC-Challenge (250 samples) | **92.8%** | 90.8% | **+2.0%** |
 | MMLU (14 subjects, 250 samples) | **75.6%** | 72.8% | **+2.8%** |
 
-### Resources
+#### Resources
 
 | Metric | rdna4-quant | llama.cpp Q4_K_M |
 |---|---|---|
 | VRAM (weights + KV) | 9.9 GB | 8.8 GB |
 | Weight size on disk | ~8.5 GB | ~8.4 GB |
 | KV cache format | FP8 E4M3 (1 byte) | FP16 (2 bytes) |
+
+### Qwen3-30B-A3B (MoE, 48 layers, 128 experts, top-8)
+
+Comparison with llama.cpp Q4_K_M **Vulkan** backend (`-dev Vulkan1`) on the same GPU.
+
+#### Speed
+
+| Metric | rdna4-quant | llama.cpp Q4_K_M (Vulkan) | Difference |
+|---|---|---|---|
+| Decode (ctx=128) | 163 t/s | **177 t/s** | -8% |
+| Decode (ctx=512) | 139 t/s | **175 t/s** | -21% |
+| Decode (ctx=1024) | 121 t/s | **169 t/s** | -29% |
+| Decode (ctx=4096) | 67 t/s | **156 t/s** | -57% |
+| Prefill (pp512) | 351 t/s | **2,987 t/s** | -88% |
+
+#### Quality
+
+| Benchmark | rdna4-quant | llama.cpp Q4_K_M | Difference |
+|---|---|---|---|
+| MMLU | **80.1%** | 78.9% | **+1.2%** |
+
+#### Resources
+
+| Metric | rdna4-quant | llama.cpp Q4_K_M |
+|---|---|---|
+| VRAM (model) | 18.6 GB | ~18.0 GB |
+| Weight size on disk | 16.0 GB | 17.3 GB |
+| KV cache format | FP16 (2 bytes) | Q8_0 (~1 byte) |
+
+> **Note:** For Qwen3-30B-A3B MoE, llama.cpp Vulkan is faster than our custom HIP engine at all context lengths. Our advantage is quality (+1.2pp MMLU). Main bottlenecks: FP16 KV cache (2x bandwidth vs Q8), Python prefill (no WMMA GEMM), and kernel launch overhead (~480 HIP launches per token vs Vulkan command buffers).
 
 ---
 
@@ -247,7 +280,8 @@ W[i,j] = (nibble_ij - zero_point_block) * scale_block
 ## Supported Models
 
 Currently tested with:
-- **Qwen3-14B** (primary target, 40 layers, hidden=5120)
+- **Qwen3-14B** (dense, 40 layers, hidden=5120) — `int4_engine_v5.py`
+- **Qwen3-30B-A3B** (MoE, 48 layers, 128 experts/layer, top-8) — `qwen3_30b_a3b/int4_engine_moe.py`
 
 The engine supports any Qwen2/Qwen3 architecture model. Extending to LLaMA/Mistral requires minor modifications to the layer structure.
 
@@ -265,20 +299,18 @@ All decode kernels are in `hip_int4/int4_decode_step.hip` (~3600 lines):
 - **`flash_decode_partial`** — Split-K flash attention reading FP8 KV cache. Partial softmax per block, then reduce across blocks.
 - **`f32_to_fp8e4m3` / `fp8e4m3_to_f32`** — Branchless FP8 E4M3 encode/decode for KV cache.
 
-### Why 61 t/s? (Bandwidth Analysis)
+### Bandwidth Analysis (Dense Qwen3-14B)
 
 Single-token decode is **memory-bandwidth limited**:
 
 ```
 Total weight data per token:  ~7 GB
-Peak HBM bandwidth:           640 GB/s (R9700)
-Effective utilization:        ~88% (545 GB/s)
-Theoretical minimum:          7 GB / 545 GB/s = 12.8 ms
-Non-GEMV overhead:            ~3.4 ms (norms, attention, RoPE)
-Total:                        ~16.2 ms = 61.7 t/s
+Peak bandwidth:               576 GB/s (R9700)
+Effective utilization:        ~88% (507 GB/s)
+Theoretical minimum:          7 GB / 507 GB/s = 13.8 ms
+Non-GEMV overhead:            ~2.6 ms (norms, attention, RoPE)
+Total:                        ~16.4 ms ≈ 61 t/s
 ```
-
-We're at **~95% of theoretical maximum** for this hardware.
 
 ### WMMA Lane Mapping Discovery (RDNA4)
 
@@ -330,14 +362,14 @@ GPU architecture is **auto-detected** — no manual configuration needed for mos
 ```
 rdna4-quant/
 ├── README.md                          # This file
-├── RESEARCH_NOTES.md                  # Detailed experiment log
+├── LESSONS_LEARNED.md                 # What works and what doesn't (quant methods, optimizations)
+├── RESEARCH_NOTES.md                  # Detailed experiment log (Qwen3-14B)
 ├── REPRODUCTION_RECIPE.md             # Step-by-step quantization guide
-├── NOVELTY_ANALYSIS.md                # What's new vs literature
 ├── DISCOVERY_GFX12_WMMA_OUTPUT.md     # WMMA lane mapping for RDNA4
 ├── requirements.txt
 ├── LICENSE                            # MIT
 │
-├── # Quantization
+├── # Quantization (Dense)
 ├── quantize_v4_gptq.py               # Best quality (mixed INT4/INT8, PPL 7.692)
 ├── quantize_v5_pure_int4.py           # Pure INT4 (smaller, PPL 7.787)
 ├── int4_quant_v2.py                   # Core INT4 asymmetric + GPTQ
@@ -345,15 +377,21 @@ rdna4-quant/
 ├── hadamard_utils.py                  # Hadamard rotation
 ├── measure_sensitivity.py             # Layer sensitivity analysis
 │
-├── # Inference
+├── # Inference (Dense: Qwen3-14B)
 ├── int4_engine_v5.py                  # Main engine (HIP decode + rocBLAS prefill)
 ├── api_server.py                      # OpenAI-compatible API server (FastAPI)
 ├── engine_utils.py                    # Shared classes (KVCache, RMSNorm, RoPE)
 ├── fused_ops.py                       # Triton fused kernels
 │
+├── # MoE (Qwen3-30B-A3B)
+├── qwen3_30b_a3b/
+│   ├── quantize_moe_gptq.py          # MoE quantization (GPTQ + Hadamard per expert)
+│   ├── int4_engine_moe.py            # MoE inference engine
+│   └── quantized_moe_v2_g64/         # Quantized weights (INT4 g64)
+│
 ├── # HIP Kernels
 ├── hip_int4/
-│   ├── int4_decode_step.hip           # INT4 GEMV + attention + norms (~3600 lines)
+│   ├── int4_decode_step.hip           # INT4 GEMV + attention + norms + MoE routing
 │   └── setup.py
 │
 ├── # Data
@@ -365,10 +403,11 @@ rdna4-quant/
 
 ## Known Limitations
 
-- **Qwen3 only**: Currently supports Qwen2/Qwen3 architecture. LLaMA/Mistral support requires a model config mapping (architectures are nearly identical — RMSNorm, RoPE, GQA — only tensor naming differs).
-- **Static KV cache**: Fixed-size allocation. No paged attention (vLLM-style). Works well up to ~8k context, but very long contexts (32k+) will need KV cache paging.
-- **Single GPU**: No tensor parallelism yet. Decode is bandwidth-limited at ~61 t/s on single R9700.
-- **VRAM**: Uses ~1.1 GB more than GGUF Q4_K_M due to FP16 scales (higher quality tradeoff).
+- **Qwen3 only**: Currently supports Qwen2/Qwen3 dense and MoE architectures. LLaMA/Mistral support requires a model config mapping.
+- **MoE decode slower than GGUF**: For Qwen3-30B-A3B, llama.cpp Vulkan is faster at all context lengths. Our MoE engine needs Q8 KV cache and WMMA prefill.
+- **Static KV cache**: Fixed-size FP16 allocation. No paged attention. At long contexts (>1024) the FP16 KV cache becomes the main bottleneck.
+- **Single GPU**: No tensor parallelism yet.
+- **Python prefill for MoE**: MoE prefill runs per-expert in Python (~350 t/s vs ~3000 t/s GGUF). Dense model prefill uses rocBLAS and is competitive.
 
 ## Future Work
 

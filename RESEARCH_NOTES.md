@@ -1,4 +1,7 @@
-# AMD MXFP4/NVFP4 Quantization Research — Complete Notes
+# AMD MXFP4/NVFP4 Quantization Research — Complete Notes (Qwen3-14B)
+
+> **UWAGA:** Ten plik dotyczy eksperymentów z Qwen3-14B (dense).
+> Dla aktualnej listy co działa / nie działa (w tym MoE Qwen3-30B-A3B) → patrz **LESSONS_LEARNED.md**
 
 **Project**: Custom 4-bit quantization engine for AMD RDNA4 (gfx1201)
 **Model**: Qwen3-14B (14.77B params, 40 layers, hidden=5120, intermediate=17408)
@@ -125,12 +128,12 @@ our v4 INT4 engine **beats Q4_K_M** by 0.023 PPL.
 | MXFP4 (Triton GEMM + HIP GEMV) | 2287 | ~15 | 8648 |
 | MXFP4 (Triton GEMM, PPL eval) | 2857 | — | 8648 |
 | GGUF Q4_K_M (llama.cpp ROCm) | 541 (pp512) | 52 | 8788 |
-| GGUF Q4_K_M (llama.cpp Vulkan) | 535 (pp512) | 7 (broken) | — |
+| GGUF Q4_K_M (llama.cpp Vulkan) | 535 (pp512) | ~61 (fixed) | — |
 
 Key observations:
 - Our Triton GEMM prefill is **4.2x faster** than llama.cpp ROCm for pp512
 - Decode speed (single-token GEMV) is the bottleneck — bandwidth-limited
-- llama.cpp Vulkan decode is broken on RDNA4 (warp_size=64 misdetect for Wave32)
+- ~~llama.cpp Vulkan decode broken on RDNA4~~ — naprawione, Vulkan teraz szybszy niż ROCm
 - WMMA GEMM kernel achieves **40.8 TFLOPS** (53% of FP16 theoretical)
 
 ---
@@ -212,9 +215,9 @@ Various experimental approaches within MXFP4 format that showed no meaningful im
 The key insight: asymmetric + Hadamard rotation + proper GPTQ calibration BEATS Q4_K_M.
 
 ### 6. llama.cpp Vulkan backend on RDNA4
-- Decode completely broken: 7.22 t/s vs 51.88 t/s ROCm
-- Root cause: RADV misdetects RDNA4 as Wave64 (it's Wave32)
-- Must use ROCm backend or our custom engine
+- ~~Decode completely broken: 7.22 t/s vs 51.88 t/s ROCm~~ **NAPRAWIONE w llama.cpp build c5a778891**
+- Vulkan teraz działa i jest SZYBSZY niż ROCm na RDNA4 (np. Qwen3-30B-A3B: 177 t/s Vulkan vs ~120 t/s ROCm)
+- Zawsze benchmarkuj z `-dev Vulkan1` (device 0 = iGPU!)
 
 ---
 
@@ -373,7 +376,7 @@ cd hip_int4 && python setup.py build_ext --inplace
 5. **NVFP4 is better than MXFP4 but INT4+FP16 scales is even better** — FP16 scales > E4M3 > E8M0
 6. **Watch for ROCm HIP crashes** — save intermediate results, use per-layer checkpointing
 7. **WMMA lane mapping is column-distributed** — see DISCOVERY_GFX12_WMMA_OUTPUT.md
-8. **llama.cpp Vulkan is broken on RDNA4** — use ROCm backend only
+8. **llama.cpp Vulkan działa na RDNA4** (naprawione) — używaj Vulkan z `-dev Vulkan1`, jest szybszy niż ROCm
 9. **More calibration steps can overfit** — 150-200 steps is the sweet spot
 10. **Decode is bandwidth-limited** — kernel fusion matters more than compute optimization
 11. **Compare apples to apples** — always use same eval methodology when comparing models

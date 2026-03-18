@@ -48,6 +48,7 @@ setup(
                 'nvcc': ['-O3', f'--offload-arch={GPU_ARCH}', '-std=c++17',
                          '-Wno-unused-result'],
             },
+            libraries=['hipblas'],
         ),
     ],
     cmdclass={'build_ext': BuildExtension},
