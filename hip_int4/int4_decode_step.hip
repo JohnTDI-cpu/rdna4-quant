@@ -1459,6 +1459,108 @@ __global__ void f32_to_fp16(const float* __restrict__ in, __half* __restrict__ o
 }
 
 // ============================================================
+// WMMA INT4 GEMM — native gfx12 v_wmma_i32_16x16x32_iu4
+// Tile: 16M × 64N per block, 1 warp, 4 WMMA per K-step
+// Column-distributed store: lane%16=col, (lane/16)*8+j=row
+// From DISCOVERY_GFX12_WMMA_OUTPUT.md — verified correct on R9700
+// ============================================================
+typedef int wmma_int2 __attribute__((ext_vector_type(2)));
+typedef int wmma_int8 __attribute__((ext_vector_type(8)));
+
+// Tile weights: [N, K/2] packed → [K/8, N/16, 64] for coalesced WMMA loads
+__global__ void wmma_tile_weights(const uint8_t* src, uint8_t* dst, int N, int K) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int K2=K/2, NB=N/16, total=(K/8)*NB*16;
+    if (tid >= total) return;
+    int kc=tid/(NB*16), rem=tid%(NB*16), nb=rem/16, nl=rem%16;
+    *(uint32_t*)(dst+(int64_t)(kc*NB+nb)*64+nl*4)
+        = *(const uint32_t*)(src+(int64_t)(nb*16+nl)*K2+kc*4);
+}
+
+// Transpose scales: [N, ng, 2] → [ng, N, 2] (group-major for coalesced access)
+__global__ void wmma_transpose_scales(const __half* si, __half* so, int N, int ng) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= N*ng) return;
+    int n=tid/ng, g=tid%ng;
+    so[(int64_t)g*N*2+n*2]   = si[(int64_t)n*ng*2+g*2];
+    so[(int64_t)g*N*2+n*2+1] = si[(int64_t)n*ng*2+g*2+1];
+}
+
+// Quantize activations to unsigned INT4 with per-group scale+zero+sum
+__global__ void wmma_quantize_act(
+    const __half* input, uint8_t* act_q, float* act_meta, int M, int K, int M_pad)
+{
+    int g=blockIdx.x, m=blockIdx.y, tid=threadIdx.x;
+    if (m >= M) return;
+    float val = __half2float(input[(int64_t)m*K + g*32 + tid]);
+    float vmin=val, vmax=val;
+    for (int off=16;off>0;off>>=1) { vmin=fminf(vmin,__shfl_xor(vmin,off)); vmax=fmaxf(vmax,__shfl_xor(vmax,off)); }
+    float a_range=vmax-vmin, a_scale=(a_range>1e-10f)?(a_range/15.0f):1e-10f;
+    int q=__float2int_rn((val-vmin)/a_scale); q=max(0,min(15,q));
+    float a_sum=(float)q;
+    for (int off=16;off>0;off>>=1) a_sum+=__shfl_xor(a_sum,off);
+    int q_other=__shfl_xor(q,1);
+    if (tid&1) act_q[(int64_t)m*(K/2)+g*16+tid/2]=(uint8_t)((q<<4)|q_other);
+    if (tid==0) { int ng=K/32; act_meta[((int64_t)m*ng+g)*3]=a_scale; act_meta[((int64_t)m*ng+g)*3+1]=vmin; act_meta[((int64_t)m*ng+g)*3+2]=a_sum; }
+}
+
+// WMMA INT4 GEMM: 16M×64N per block, 4 WMMA per K-step, GS=32
+template<int GS=32>
+__global__ __launch_bounds__(32, 8)
+void wmma_int4_gemm(
+    const uint8_t* act_q, const float* act_meta,
+    const uint8_t* wt, const __half* sz_gn,
+    __half* output, int M, int M_pad, int N_pad, int K)
+{
+    const int lane=threadIdx.x, m_start=blockIdx.y*16, n_start=blockIdx.x*64;
+    if(m_start>=M) return;
+    const int nl=lane%16, kg=lane/16, NB=N_pad/16, ng=K/GS;
+    const int m_idx=m_start+nl;
+    const bool m_valid=(m_idx<M);
+    const uint32_t ones4=0x11111111u;
+    float a0[8]={},a1[8]={},a2[8]={},a3[8]={};
+    for(int g=0;g<ng;g++){
+        int k=g*GS; int64_t sb=(int64_t)g*N_pad*2;
+        wmma_int2 A; float as,az,xz;
+        if(m_valid){
+            const uint8_t*aq=act_q+(int64_t)m_idx*(K/2)+k/2+kg*8;
+            A=(wmma_int2){*(const int*)(aq),*(const int*)(aq+4)};
+            const float*meta=act_meta+((int64_t)m_idx*ng+g)*3;
+            as=meta[0];az=meta[1];xz=as*meta[2]+az*32.0f;
+        }else{A={};as=0;az=0;xz=0;}
+        // Load 4 N-tiles of B weights + compute w_sum
+        #define LOAD_B(idx) wmma_int2 B##idx; float bs##idx; \
+            {int nb=n_start/16+idx;int kc0=k/8+kg*2,kc1=kc0+1; \
+             uint32_t p0=*(const uint32_t*)(wt+(int64_t)(kc0*NB+nb)*64+nl*4); \
+             uint32_t p1=*(const uint32_t*)(wt+(int64_t)(kc1*NB+nb)*64+nl*4); \
+             B##idx=(wmma_int2){(int)p0,(int)p1}; \
+             uint32_t bs=__builtin_amdgcn_udot8(p0,ones4,0u,false); \
+             bs=__builtin_amdgcn_udot8(p1,ones4,bs,false); \
+             bs##idx=(float)bs+__shfl_xor((float)bs,16);}
+        LOAD_B(0) LOAD_B(1) LOAD_B(2) LOAD_B(3)
+        #undef LOAD_B
+        // 4 WMMA instructions: A[16×32] × B[32×16] → R[16×16]
+        wmma_int8 R0={},R1={},R2={},R3={};
+        R0=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(false,A,false,B0,R0,false);
+        R1=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(false,A,false,B1,R1,false);
+        R2=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(false,A,false,B2,R2,false);
+        R3=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(false,A,false,B3,R3,false);
+        // Dequant: acc += ws*as*R + ws*az*bs - ws*wz*xz (asymmetric correction)
+        #define DEQUANT(idx) {int ni=n_start+idx*16+nl; \
+            float ws=__half2float(sz_gn[sb+ni*2]),wz=__half2float(sz_gn[sb+ni*2+1]); \
+            float ws_as=ws*as,corr=ws*az*bs##idx-ws*wz*xz; \
+            for(int j=0;j<8;j++) a##idx[j]+=ws_as*(float)R##idx[j]+corr;}
+        DEQUANT(0) DEQUANT(1) DEQUANT(2) DEQUANT(3)
+        #undef DEQUANT
+    }
+    // Store: column-distributed (lane%16=col, (lane/16)*8+j=row)
+    for(int j=0;j<8;j++){int om=m_start+kg*8+j;if(om>=M)continue;
+        __half*row=output+(int64_t)om*N_pad;
+        row[n_start+nl]=__float2half(a0[j]);row[n_start+16+nl]=__float2half(a1[j]);
+        row[n_start+32+nl]=__float2half(a2[j]);row[n_start+48+nl]=__float2half(a3[j]);}
+}
+
+// ============================================================
 // Pure-HIP MoE prefill kernels — zero PyTorch ATen calls in hot loop
 // ============================================================
 
@@ -5078,129 +5180,6 @@ torch::Tensor precompute_wsum(
 // ============================================================
 // INT4 WMMA v7: 2-pass W4A4 GEMM — zero extra VRAM, 916 t/s pp128
 // ============================================================
-typedef int v7_int2 __attribute__((ext_vector_type(2)));
-typedef int v7_int8 __attribute__((ext_vector_type(8)));
-
-__global__ void v7_tile_weights(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, int N, int K) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int K2 = K / 2, NB = N / 16, total = (K / 8) * NB * 16;
-    if (tid >= total) return;
-    int kc = tid / (NB * 16), rem = tid % (NB * 16), nb = rem / 16, nl = rem % 16;
-    *(uint32_t*)(dst + (int64_t)(kc * NB + nb) * 64 + nl * 4)
-        = *(const uint32_t*)(src + (int64_t)(nb*16+nl) * K2 + kc * 4);
-}
-
-__global__ void v7_transpose_scales(const __half* si, __half* so, int N, int ng) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= N * ng) return;
-    int n = tid / ng, g = tid % ng;
-    so[(int64_t)g*N*2+n*2]   = si[(int64_t)n*ng*2+g*2];
-    so[(int64_t)g*N*2+n*2+1] = si[(int64_t)n*ng*2+g*2+1];
-}
-
-__global__ void v7_quantize_act(
-    const __half* __restrict__ input, uint8_t* __restrict__ act_q,
-    float* __restrict__ act_meta, int M, int K, int M_pad)
-{
-    int g = blockIdx.x, m = blockIdx.y, tid = threadIdx.x;
-    if (m >= M) return;
-    float val = __half2float(input[(int64_t)m * K + g * 32 + tid]);
-    float vmin = val, vmax = val;
-    for (int off = 16; off > 0; off >>= 1) {
-        vmin = fminf(vmin, __shfl_xor(vmin, off));
-        vmax = fmaxf(vmax, __shfl_xor(vmax, off));
-    }
-    float a_range = vmax - vmin;
-    float a_scale = (a_range > 1e-10f) ? (a_range / 15.0f) : 1e-10f;
-    int q = __float2int_rn((val - vmin) / a_scale);
-    q = max(0, min(15, q));
-    float a_sum = (float)q;
-    for (int off = 16; off > 0; off >>= 1) a_sum += __shfl_xor(a_sum, off);
-    int q_other = __shfl_xor(q, 1);
-    if (tid & 1) act_q[(int64_t)m * (K/2) + g * 16 + tid / 2] = (uint8_t)((q << 4) | q_other);
-    if (tid == 0) {
-        int ng = K / 32;
-        act_meta[((int64_t)m * ng + g) * 3]     = a_scale;
-        act_meta[((int64_t)m * ng + g) * 3 + 1] = vmin;
-        act_meta[((int64_t)m * ng + g) * 3 + 2] = a_sum;
-    }
-}
-
-template<int GS=32>
-__global__ __launch_bounds__(32, 8)
-void v7_wmma_kernel(
-    const uint8_t* __restrict__ act_q, const float* __restrict__ act_meta,
-    const uint8_t* __restrict__ wt, const __half* __restrict__ sz_gn,
-    __half* __restrict__ output, int M, int M_pad, int N_pad, int K)
-{
-    const int lane=threadIdx.x, m_start=blockIdx.y*16, n_start=blockIdx.x*64;
-    if(m_start>=M) return;
-    const int nl=lane%16, kg=lane/16, NB=N_pad/16, ng=K/GS, nb0=n_start/16;
-    const int m_idx=m_start+nl;
-    const bool m_valid=(m_idx<M);
-    const uint32_t ones4=0x11111111u;
-    float acc0[8]={},acc1[8]={},acc2[8]={},acc3[8]={};
-    for(int g=0;g<ng;g++){
-        int k=g*GS; int64_t sb=(int64_t)g*N_pad*2;
-        v7_int2 A; float a_scale,a_zero,xz;
-        if(m_valid){
-            const uint8_t*aq=act_q+(int64_t)m_idx*(K/2)+k/2+kg*8;
-            A=(v7_int2){*(const int*)(aq),*(const int*)(aq+4)};
-            const float*meta=act_meta+((int64_t)m_idx*ng+g)*3;
-            a_scale=meta[0];a_zero=meta[1];xz=a_scale*meta[2]+a_zero*32.0f;
-        }else{A={};a_scale=0;a_zero=0;xz=0;}
-        v7_int2 B0,B1,B2,B3; float bs0,bs1,bs2,bs3;
-        {int nb=nb0+0;int kc0=k/8+kg*2,kc1=kc0+1;
-         uint32_t p0=*(const uint32_t*)(wt+(int64_t)(kc0*NB+nb)*64+nl*4);
-         uint32_t p1=*(const uint32_t*)(wt+(int64_t)(kc1*NB+nb)*64+nl*4);
-         B0=(v7_int2){(int)p0,(int)p1};
-         uint32_t bs=__builtin_amdgcn_udot8(p0,ones4,0u,false);
-         bs=__builtin_amdgcn_udot8(p1,ones4,bs,false);
-         bs0=(float)bs+__shfl_xor((float)bs,16);}
-        {int nb=nb0+1;int kc0=k/8+kg*2,kc1=kc0+1;
-         uint32_t p0=*(const uint32_t*)(wt+(int64_t)(kc0*NB+nb)*64+nl*4);
-         uint32_t p1=*(const uint32_t*)(wt+(int64_t)(kc1*NB+nb)*64+nl*4);
-         B1=(v7_int2){(int)p0,(int)p1};
-         uint32_t bs=__builtin_amdgcn_udot8(p0,ones4,0u,false);
-         bs=__builtin_amdgcn_udot8(p1,ones4,bs,false);
-         bs1=(float)bs+__shfl_xor((float)bs,16);}
-        {int nb=nb0+2;int kc0=k/8+kg*2,kc1=kc0+1;
-         uint32_t p0=*(const uint32_t*)(wt+(int64_t)(kc0*NB+nb)*64+nl*4);
-         uint32_t p1=*(const uint32_t*)(wt+(int64_t)(kc1*NB+nb)*64+nl*4);
-         B2=(v7_int2){(int)p0,(int)p1};
-         uint32_t bs=__builtin_amdgcn_udot8(p0,ones4,0u,false);
-         bs=__builtin_amdgcn_udot8(p1,ones4,bs,false);
-         bs2=(float)bs+__shfl_xor((float)bs,16);}
-        {int nb=nb0+3;int kc0=k/8+kg*2,kc1=kc0+1;
-         uint32_t p0=*(const uint32_t*)(wt+(int64_t)(kc0*NB+nb)*64+nl*4);
-         uint32_t p1=*(const uint32_t*)(wt+(int64_t)(kc1*NB+nb)*64+nl*4);
-         B3=(v7_int2){(int)p0,(int)p1};
-         uint32_t bs=__builtin_amdgcn_udot8(p0,ones4,0u,false);
-         bs=__builtin_amdgcn_udot8(p1,ones4,bs,false);
-         bs3=(float)bs+__shfl_xor((float)bs,16);}
-        v7_int8 R0={},R1={},R2={},R3={};
-        R0=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(false,A,false,B0,R0,false);
-        R1=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(false,A,false,B1,R1,false);
-        R2=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(false,A,false,B2,R2,false);
-        R3=__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(false,A,false,B3,R3,false);
-        {int ni=n_start+0*16+nl;float ws=__half2float(sz_gn[sb+ni*2]),wz=__half2float(sz_gn[sb+ni*2+1]);
-         float ws_as=ws*a_scale,corr=ws*a_zero*bs0-ws*wz*xz;
-         for(int j=0;j<8;j++)acc0[j]+=ws_as*(float)R0[j]+corr;}
-        {int ni=n_start+1*16+nl;float ws=__half2float(sz_gn[sb+ni*2]),wz=__half2float(sz_gn[sb+ni*2+1]);
-         float ws_as=ws*a_scale,corr=ws*a_zero*bs1-ws*wz*xz;
-         for(int j=0;j<8;j++)acc1[j]+=ws_as*(float)R1[j]+corr;}
-        {int ni=n_start+2*16+nl;float ws=__half2float(sz_gn[sb+ni*2]),wz=__half2float(sz_gn[sb+ni*2+1]);
-         float ws_as=ws*a_scale,corr=ws*a_zero*bs2-ws*wz*xz;
-         for(int j=0;j<8;j++)acc2[j]+=ws_as*(float)R2[j]+corr;}
-        {int ni=n_start+3*16+nl;float ws=__half2float(sz_gn[sb+ni*2]),wz=__half2float(sz_gn[sb+ni*2+1]);
-         float ws_as=ws*a_scale,corr=ws*a_zero*bs3-ws*wz*xz;
-         for(int j=0;j<8;j++)acc3[j]+=ws_as*(float)R3[j]+corr;}
-    }
-    for(int j=0;j<8;j++){int om=m_start+kg*8+j;if(om>=M)continue;
-        __half*row=output+(int64_t)om*N_pad;
-        row[n_start+nl]=__float2half(acc0[j]);row[n_start+16+nl]=__float2half(acc1[j]);
-        row[n_start+32+nl]=__float2half(acc2[j]);row[n_start+48+nl]=__float2half(acc3[j]);}
-}
 
 std::vector<torch::Tensor> v7_prepare_weights(
     torch::Tensor packed_w, torch::Tensor scales, int64_t N, int64_t K, int64_t group_size)
@@ -5214,14 +5193,14 @@ std::vector<torch::Tensor> v7_prepare_weights(
         torch::zeros({N_pad, K/2}, torch::dtype(torch::kUInt8).device(device)) : packed_w.contiguous();
     if (N_pad != N) w_padded.narrow(0, 0, N).copy_(packed_w);
     int w_total = (K/8) * (N_pad/16) * 16;
-    hipLaunchKernelGGL(v7_tile_weights, dim3((w_total+255)/256), dim3(256), 0, stream,
+    hipLaunchKernelGGL(wmma_tile_weights, dim3((w_total+255)/256), dim3(256), 0, stream,
         w_padded.data_ptr<uint8_t>(), wt.data_ptr<uint8_t>(), N_pad, K);
     torch::Tensor s_flat = scales.reshape({(long)N, (long)(ng*2)}).contiguous();
     torch::Tensor s_padded = (N_pad != N) ?
         torch::zeros({N_pad, (long)(ng*2)}, torch::dtype(torch::kHalf).device(device)) : s_flat;
     if (N_pad != N) s_padded.narrow(0, 0, N).copy_(s_flat);
     auto sz_gn = torch::empty({(long)ng, N_pad, 2}, torch::dtype(torch::kHalf).device(device));
-    hipLaunchKernelGGL(v7_transpose_scales, dim3((N_pad*ng+255)/256), dim3(256), 0, stream,
+    hipLaunchKernelGGL(wmma_transpose_scales, dim3((N_pad*ng+255)/256), dim3(256), 0, stream,
         reinterpret_cast<const __half*>(s_padded.data_ptr()),
         reinterpret_cast<__half*>(sz_gn.data_ptr()), N_pad, ng);
     return {wt, sz_gn.reshape({(long)(ng*N_pad*2)})};
@@ -5237,17 +5216,17 @@ void v7_gemm(
     int M_pad = ((M + 15) / 16) * 16;
     int ng = K / group_size;
     auto stream = at::hip::getCurrentHIPStream();
-   hipLaunchKernelGGL(( v7_quantize_act), dim3(dim3(ng, M_pad)), dim3(32), 0, stream, 
+   hipLaunchKernelGGL(( wmma_quantize_act), dim3(dim3(ng, M_pad)), dim3(32), 0, stream, 
         reinterpret_cast<const __half*>(input.data_ptr()),
         act_q_buf.data_ptr<uint8_t>(), act_meta_buf.data_ptr<float>(), M, K, M_pad);
     dim3 grid((N_pad + 63) / 64, (M + 15) / 16);
     if (group_size == 64) {
-       hipLaunchKernelGGL(( v7_wmma_kernel<64>), dim3(grid), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( wmma_int4_gemm<64>), dim3(grid), dim3(32), 0, stream, 
             act_q_buf.data_ptr<uint8_t>(), act_meta_buf.data_ptr<float>(),
             wt.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(sz_gn.data_ptr()),
             reinterpret_cast<__half*>(output.data_ptr()), M, M_pad, (int)N_pad, (int)K);
     } else {
-       hipLaunchKernelGGL(( v7_wmma_kernel<32>), dim3(grid), dim3(32), 0, stream, 
+       hipLaunchKernelGGL(( wmma_int4_gemm<32>), dim3(grid), dim3(32), 0, stream, 
             act_q_buf.data_ptr<uint8_t>(), act_meta_buf.data_ptr<float>(),
             wt.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(sz_gn.data_ptr()),
             reinterpret_cast<__half*>(output.data_ptr()), M, M_pad, (int)N_pad, (int)K);
