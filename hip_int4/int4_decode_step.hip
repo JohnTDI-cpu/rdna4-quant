@@ -1562,6 +1562,12 @@ __global__ void prefix_sum_small(
     }
 }
 
+// Element-wise add: C[i] = A[i] + B[i] for FP16
+__global__ void vadd_fp16(const __half* A, const __half* B, __half* C, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) C[i] = __float2half(__half2float(A[i]) + __half2float(B[i]));
+}
+
 // Simple row gather: dst[i] = src[indices[i]] for each row
 __global__ void gather_rows(
     const __half* __restrict__ src,  // [M, D]
@@ -1950,9 +1956,12 @@ torch::Tensor prefill_moe_logits(
 
         // === PURE HIP MoE dispatch — zero ATen calls ===
 
-        // 1. Router GEMM: normed @ gate.T → [M, E] via direct hipBLAS
+        // 1. Router GEMM: normed @ gate.T → [M, E]
         auto* rot_p = reinterpret_cast<__half*>(rot_buf.data_ptr());
-        direct_hgemm(n_p, gate_wp[li], router_out_p, M, E, D, stream);
+        {
+            auto normed_norot = torch::from_blob(n_p, {(long)M, (long)D}, opts);
+            at::mm_out(router_out, normed_norot, gate_w[li].t());
+        }
         launch_hadamard_batched(n_p, rot_p, had_p, M, D, stream);
 
         MOE_RECORD(1);
@@ -2009,7 +2018,7 @@ torch::Tensor prefill_moe_logits(
                 reinterpret_cast<__half*>(xq_gu_sc.data_ptr()),
                 total_tok, K_gu);
 
-            constexpr int BN = 4, BM = 4;
+            constexpr int BN = 4, BM = 8;
             hipLaunchKernelGGL((gemv_w4a4_udot8_v3<BN, BM>),
                 dim3((N_gu + BN - 1) / BN, E), dim3(32), 0, stream,
                 reinterpret_cast<const uint8_t*>(xq_gu_buf.data_ptr()),
@@ -2071,10 +2080,9 @@ torch::Tensor prefill_moe_logits(
                 hipLaunchKernelGGL(dequant_int4_g64_rm_kernel,
                     dim3((gu_total_elem + 255) / 256), dim3(256), 0, stream,
                     gu_packed_e, gu_scales_e, gu_w_p, N_gu, K_gu);
-                auto x_s = torch::from_blob(const_cast<__half*>(xg_p)+(int64_t)off*K_gu, {(long)cnt,(long)K_gu}, opts);
-                auto w_t = torch::from_blob(gu_w_p, {(long)N_gu,(long)K_gu}, opts);
-                auto o_s = torch::from_blob(gu_out_p+(int64_t)off*N_gu, {(long)cnt,(long)N_gu}, opts);
-                at::mm_out(o_s, x_s, w_t.t());
+                // direct hipBLAS — no from_blob, no ATen dispatch
+                direct_hgemm(xg_p + (int64_t)off*K_gu, gu_w_p,
+                             gu_out_p + (int64_t)off*N_gu, cnt, N_gu, K_gu, stream);
             }
 
             const int MAX_BATCH = 32768;
@@ -2102,10 +2110,8 @@ torch::Tensor prefill_moe_logits(
                 hipLaunchKernelGGL(dequant_int4_g64_rm_kernel,
                     dim3((dn_total_elem + 255) / 256), dim3(256), 0, stream,
                     dn_packed_e, dn_scales_e, dn_w_p, N_dn, K_dn);
-                auto s_s = torch::from_blob(rot_silu_p+(int64_t)off*K_dn, {(long)cnt,(long)K_dn}, opts);
-                auto w_t = torch::from_blob(dn_w_p, {(long)N_dn,(long)K_dn}, opts);
-                auto d_s = torch::from_blob(dn_out_p+(int64_t)off*D, {(long)cnt,(long)D}, opts);
-                at::mm_out(d_s, s_s, w_t.t());
+                direct_hgemm(rot_silu_p + (int64_t)off*K_dn, dn_w_p,
+                             dn_out_p + (int64_t)off*D, cnt, N_dn, K_dn, stream);
             }
         }
 
@@ -2168,10 +2174,10 @@ torch::Tensor prefill_moe_logits(
                 moe_p, r_p, in_np[li + 1], n_p, x_p, D, rms_eps);
             if (li <= 1 || M >= 8192) { hipDeviceSynchronize(); auto e = hipGetLastError(); fprintf(stderr, "  L%d final_res_norm %s\n", li, e==hipSuccess?"OK":hipGetErrorString(e)); }
         } else {
-            // Last layer: just add residual, no next-layer norm
-            auto x_t = torch::from_blob(x_p, {(long)M, (long)D}, opts);
-            auto r_t = torch::from_blob(r_p, {(long)M, (long)D}, opts);
-            x_t.copy_(r_t + moe_out);
+            // Last layer: x = residual + moe_out (pure HIP)
+            int total = M * D;
+            hipLaunchKernelGGL(vadd_fp16, dim3((total+255)/256), dim3(256), 0, stream,
+                r_p, moe_p, x_p, total);
         }
     }
 
