@@ -2157,3 +2157,30 @@ Attention (LDS reuse): mniej wavefrontów = lepiej (cache-bound)
 ```
 
 Jedna linijka `__launch_bounds__` dała +40% na attention. To samo co GGUF robi z `limit_occupancy_shmem`.
+
+---
+
+## Lekcja 28: SWMMAC A fragment = ROWS nie columns (2026-03-18)
+
+### Odkrycie empiryczne
+
+SWMMAC `V_SWMMAC_I32_16X16X64_IU4`:
+- **A fragment (sparse): lane nl = ROW nl** (nie kolumna!)
+- **B fragment (dense): lane nl = COLUMN nl**  
+- **Output C: lane nl = COLUMN nl** (jak dense WMMA, DISCOVERY confirmed)
+
+To jest ODWROTNE od output layout! A = wiersze, C = kolumny.
+
+### Implikacja dla tiling
+
+Tiled sparse A: `[K_group][N_tile][16_rows × 8_bytes]` = `[K/64][N/16][128]`
+Lane nl reads bytes `[nl*8 .. nl*8+7]` → row nl of N-tile → COALESCED (16 × 8 = 128 consecutive)
+
+### Raw SWMMAC throughput progression
+
+| Approach | TOPS | Bottleneck |
+|----------|------|------------|
+| Row-major scattered | 31 | Memory latency (scattered reads) |
+| Python tiled | 67 | Partially coalesced |
+| **Correct row-based tiled** | **TBD** | Should approach 477 TOPS |
+| Raw register-only | 477 | Hardware peak |
