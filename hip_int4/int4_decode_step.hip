@@ -1439,16 +1439,16 @@ __global__ void weighted_scatter_add_f32(
     float* __restrict__ moe_out_f32,  // [M, D] float32 accumulator
     const __half* __restrict__ dn,    // [total_tok, D]
     const __half* __restrict__ weight, // [total_tok]
-    const int64_t* __restrict__ token_ids, // [total_tok]
+    const int* __restrict__ token_ids, // [total_tok] int32
     int D, int total_tok
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = tid / D;  // token index
-    int d = tid % D;  // dimension
+    int i = tid / D;
+    int d = tid % D;
     if (i >= total_tok) return;
     float w = __half2float(weight[i]);
     float v = __half2float(dn[(int64_t)i * D + d]) * w;
-    int64_t out_idx = token_ids[i] * D + d;
+    int out_idx = token_ids[i] * D + d;
     atomicAdd(&moe_out_f32[out_idx], v);
 }
 
@@ -1456,6 +1456,146 @@ __global__ void weighted_scatter_add_f32(
 __global__ void f32_to_fp16(const float* __restrict__ in, __half* __restrict__ out, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) out[i] = __float2half(in[i]);
+}
+
+// ============================================================
+// Pure-HIP MoE prefill kernels — zero PyTorch ATen calls in hot loop
+// ============================================================
+
+// Fused softmax + top-k + normalize: one kernel replaces 5 ATen ops
+// Grid: (M), Block: (128 or 256). Each block processes one token's E=128 expert logits.
+__global__ void softmax_topk_batched(
+    const __half* __restrict__ router_logits,  // [M, E] FP16
+    int* __restrict__ flat_expert,             // [M*k] int32 output
+    __half* __restrict__ flat_weight,          // [M*k] FP16 output
+    int* __restrict__ flat_token,              // [M*k] int32 output (token_id = blockIdx.x)
+    int E, int k
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    // Load logits into shared memory
+    __shared__ float svals[256];  // max E=256
+    float val = (tid < E) ? __half2float(router_logits[row * E + tid]) : -1e30f;
+
+    // Softmax: max reduction
+    float lmax = val;
+    for (int off = 16; off >= 1; off >>= 1) lmax = fmaxf(lmax, __shfl_xor(lmax, off));
+    __shared__ float scratch[8];
+    if (tid % 32 == 0) scratch[tid / 32] = lmax;
+    __syncthreads();
+    if (tid < blockDim.x / 32) {
+        float v = scratch[tid];
+        for (int off = 4; off >= 1; off >>= 1) v = fmaxf(v, __shfl_xor(v, off));
+        if (tid == 0) scratch[0] = v;
+    }
+    __syncthreads();
+    float gmax = scratch[0];
+
+    // Softmax: exp + sum
+    float e = (tid < E) ? expf(val - gmax) : 0.0f;
+    float lsum = e;
+    for (int off = 16; off >= 1; off >>= 1) lsum += __shfl_xor(lsum, off);
+    if (tid % 32 == 0) scratch[tid / 32] = lsum;
+    __syncthreads();
+    if (tid < blockDim.x / 32) {
+        float v = scratch[tid];
+        for (int off = 4; off >= 1; off >>= 1) v += __shfl_xor(v, off);
+        if (tid == 0) scratch[0] = v;
+    }
+    __syncthreads();
+    svals[tid] = (tid < E && scratch[0] > 0.0f) ? (e / scratch[0]) : 0.0f;
+    __syncthreads();
+
+    // Serial top-K by thread 0 (k=8, E=128 → 8×128 = 1024 comparisons, trivial)
+    if (tid == 0) {
+        float sum_k = 0.0f;
+        int base = row * k;
+        for (int r = 0; r < k; r++) {
+            int best = 0; float bv = svals[0];
+            for (int i = 1; i < E; i++) {
+                if (svals[i] > bv) { bv = svals[i]; best = i; }
+            }
+            flat_expert[base + r] = best;
+            flat_weight[base + r] = __float2half(bv);
+            flat_token[base + r] = row;
+            sum_k += bv;
+            svals[best] = -1.0f;
+        }
+        float inv = (sum_k > 0.0f) ? (1.0f / sum_k) : 1.0f;
+        for (int r = 0; r < k; r++)
+            flat_weight[base + r] = __float2half(__half2float(flat_weight[base + r]) * inv);
+    }
+}
+
+// GPU-side exclusive prefix sum for E=128 elements (single warp-group)
+__global__ void prefix_sum_small(
+    const int* __restrict__ counts,  // [E] input
+    int* __restrict__ offsets,       // [E] exclusive prefix sum output
+    int* __restrict__ write_pos,     // [E] copy of offsets (for atomic scatter)
+    int E
+) {
+    int tid = threadIdx.x;
+    __shared__ int smem[256];
+    smem[tid] = (tid < E) ? counts[tid] : 0;
+    __syncthreads();
+    // Blelloch scan (up-sweep + down-sweep) for E<=256
+    for (int d = 1; d < E; d <<= 1) {
+        int ai = (tid + 1) * (d << 1) - 1;
+        if (ai < E) smem[ai] += smem[ai - d];
+        __syncthreads();
+    }
+    if (tid == 0) smem[E - 1] = 0;
+    __syncthreads();
+    for (int d = E >> 1; d >= 1; d >>= 1) {
+        int ai = (tid + 1) * (d << 1) - 1;
+        if (ai < E) {
+            int t = smem[ai - d];
+            smem[ai - d] = smem[ai];
+            smem[ai] += t;
+        }
+        __syncthreads();
+    }
+    if (tid < E) {
+        offsets[tid] = smem[tid];
+        write_pos[tid] = smem[tid];
+    }
+}
+
+// Simple row gather: dst[i] = src[indices[i]] for each row
+__global__ void gather_rows(
+    const __half* __restrict__ src,  // [M, D]
+    __half* __restrict__ dst,        // [total_tok, D]
+    const int* __restrict__ indices, // [total_tok] int32
+    int D, int total_tok
+) {
+    int row = blockIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < total_tok && col < D) {
+        dst[(int64_t)row * D + col] = src[(int64_t)indices[row] * D + col];
+    }
+}
+
+// int32 variants of bucket sort (eliminate int64 overhead)
+__global__ void bucket_count_i32(
+    const int* __restrict__ expert_ids, int* __restrict__ counts, int total_tok
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < total_tok) atomicAdd(&counts[expert_ids[tid]], 1);
+}
+
+__global__ void bucket_scatter_i32(
+    const int* __restrict__ expert_ids, const int* __restrict__ token_ids,
+    const __half* __restrict__ weights, int* __restrict__ write_pos,
+    int* __restrict__ sorted_tokens, __half* __restrict__ sorted_weights,
+    int total_tok
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < total_tok) {
+        int pos = atomicAdd(&write_pos[expert_ids[tid]], 1);
+        sorted_tokens[pos] = token_ids[tid];
+        sorted_weights[pos] = weights[tid];
+    }
 }
 
 // Bucket sort by expert ID: O(N) instead of O(N log N)
@@ -1670,12 +1810,33 @@ torch::Tensor prefill_moe_logits(
     }
     auto qkv_out = torch::empty({(long)M, (long)qkv_buf_cols}, opts);
     auto router_out = torch::empty({(long)M, (long)E}, opts);
-    auto ones_buf = at::ones({(long)total_tok}, opts_l);
-    auto flat_token = at::arange(M, opts_l).unsqueeze(1).expand({M, (long)k}).reshape(-1).contiguous();
+    auto* router_out_p = reinterpret_cast<__half*>(router_out.data_ptr());
     auto d_expert_ids_all = at::arange(E, torch::dtype(torch::kInt32).device(device));
     auto* eid_all_p = d_expert_ids_all.data_ptr<int>();
 
-    // W4A4 buffers no longer needed — using dequant+rocBLAS instead
+    // Pre-allocated MoE sort buffers (int32, reused every layer — zero ATen in hot loop)
+    auto opts_i32 = torch::dtype(torch::kInt32).device(device);
+    auto moe_flat_expert = torch::empty({(long)total_tok}, opts_i32);
+    auto moe_flat_weight = torch::empty({(long)total_tok}, opts);
+    auto moe_flat_token = torch::empty({(long)total_tok}, opts_i32);
+    auto moe_counts = torch::empty({(long)E}, opts_i32);
+    auto moe_offsets = torch::empty({(long)E}, opts_i32);
+    auto moe_write_pos = torch::empty({(long)E}, opts_i32);
+    auto moe_sorted_token = torch::empty({(long)total_tok}, opts_i32);
+    auto moe_sorted_weight = torch::empty({(long)total_tok}, opts);
+    auto* mfe_p = moe_flat_expert.data_ptr<int>();
+    auto* mfw_p = reinterpret_cast<__half*>(moe_flat_weight.data_ptr());
+    auto* mft_p = moe_flat_token.data_ptr<int>();
+    auto* mcnt_p = moe_counts.data_ptr<int>();
+    auto* moff_p = moe_offsets.data_ptr<int>();
+    auto* mwp_p = moe_write_pos.data_ptr<int>();
+    auto* mst_p = moe_sorted_token.data_ptr<int>();
+    auto* msw_p = reinterpret_cast<__half*>(moe_sorted_weight.data_ptr());
+
+    // Pre-extract gate weight pointers
+    std::vector<const __half*> gate_wp(num_layers);
+    for (int li = 0; li < num_layers; li++)
+        gate_wp[li] = reinterpret_cast<const __half*>(gate_w[li].data_ptr());
 
     // Strides for expert weight indexing (constant across layers)
     int64_t gu_packed_stride = (int64_t)N_gu * (K_gu / 2);
@@ -1787,69 +1948,50 @@ torch::Tensor prefill_moe_logits(
 
         MOE_RECORD(0);  // start
 
-        // Router: normed (un-rotated) @ gate.T → [M, E]
-        auto normed_norot = torch::from_blob(n_p, {(long)M, (long)D}, opts);
-        at::mm_out(router_out, normed_norot, gate_w[li].t());
+        // === PURE HIP MoE dispatch — zero ATen calls ===
+
+        // 1. Router GEMM: normed @ gate.T → [M, E] via direct hipBLAS
         auto* rot_p = reinterpret_cast<__half*>(rot_buf.data_ptr());
+        direct_hgemm(n_p, gate_wp[li], router_out_p, M, E, D, stream);
         launch_hadamard_batched(n_p, rot_p, had_p, M, D, stream);
 
-        MOE_RECORD(1);  // after router+hadamard
+        MOE_RECORD(1);
 
-        // Top-k selection on GPU
-        auto probs = at::softmax(router_out.to(torch::kFloat32), 1).to(torch::kHalf);
-        auto [top_k_probs, top_k_ids] = probs.topk(k, 1);
-        top_k_probs = top_k_probs / top_k_probs.sum(1, true);
-        auto flat_expert = top_k_ids.reshape(-1);
-        auto flat_weight = top_k_probs.reshape(-1);
+        // 2. Fused softmax + top-k + normalize (1 kernel, no ATen)
+        hipLaunchKernelGGL(softmax_topk_batched,
+            dim3(M), dim3(128), 0, stream,
+            router_out_p, mfe_p, mfw_p, mft_p, E, k);
 
-        MOE_RECORD(2);  // after topk
+        MOE_RECORD(2);
 
-        // Bucket sort by expert ID — O(N) via histogram + scatter
-        // Much faster than PyTorch sort() which is O(N log N) and slow on ROCm for int64
-        auto counts_i32 = torch::zeros({(long)E}, torch::dtype(torch::kInt32).device(device));
-        auto* ecnt_p = counts_i32.data_ptr<int>();
-
-        // Phase 1: histogram — count tokens per expert
+        // 3. Bucket sort: histogram + prefix sum + scatter (all HIP, no ATen)
+        hipMemsetAsync(mcnt_p, 0, E * sizeof(int), stream);
         {
             int bs = 256;
-            hipLaunchKernelGGL(bucket_count, dim3((total_tok + bs-1)/bs), dim3(bs), 0, stream,
-                flat_expert.data_ptr<int64_t>(), ecnt_p, total_tok);
+            hipLaunchKernelGGL(bucket_count_i32, dim3((total_tok+bs-1)/bs), dim3(bs), 0, stream,
+                mfe_p, mcnt_p, total_tok);
         }
-
-        // Prefix sum for offsets (small E=128, use CPU-side cumsum on GPU data)
-        auto offsets_i32 = torch::empty({(long)E}, torch::dtype(torch::kInt32).device(device));
-        auto* eoff_p = offsets_i32.data_ptr<int>();
-        {
-            // cumsum on GPU: offsets = cumsum(counts) - counts
-            auto cum = torch::cumsum(counts_i32.to(torch::kLong), 0) - counts_i32.to(torch::kLong);
-            offsets_i32.copy_(cum.to(torch::kInt32));
-        }
-
-        // Phase 2: scatter tokens + weights into sorted order
-        auto sorted_token = torch::empty({(long)total_tok}, opts_l);
-        auto sorted_weight = torch::empty({(long)total_tok}, opts);
-        auto write_pos = offsets_i32.clone();  // atomic write positions start at offsets
+        hipLaunchKernelGGL(prefix_sum_small, dim3(1), dim3(128), 0, stream,
+            mcnt_p, moff_p, mwp_p, E);
         {
             int bs = 256;
-            hipLaunchKernelGGL(bucket_scatter, dim3((total_tok + bs-1)/bs), dim3(bs), 0, stream,
-                flat_expert.data_ptr<int64_t>(),
-                flat_token.data_ptr<int64_t>(),
-                reinterpret_cast<const __half*>(flat_weight.data_ptr()),
-                write_pos.data_ptr<int>(),
-                sorted_token.data_ptr<int64_t>(),
-                reinterpret_cast<__half*>(sorted_weight.data_ptr()),
-                total_tok);
+            hipLaunchKernelGGL(bucket_scatter_i32, dim3((total_tok+bs-1)/bs), dim3(bs), 0, stream,
+                mfe_p, mft_p, mfw_p, mwp_p, mst_p, msw_p, total_tok);
         }
 
-        MOE_RECORD(3);  // after sort+counts
+        MOE_RECORD(3);
 
-        at::index_select_out(x_gather_buf, rot_buf, 0, sorted_token);
-        auto* xg_p = reinterpret_cast<const __half*>(x_gather_buf.data_ptr());
-        auto* dn_out_p = reinterpret_cast<__half*>(x_gather_buf.data_ptr());
+        // 4. Gather: rot_buf[sorted_token] → x_gather_buf (HIP kernel, no ATen)
+        auto* xg_p = reinterpret_cast<__half*>(x_gather_buf.data_ptr());
+        auto* dn_out_p = xg_p;
+        hipLaunchKernelGGL(gather_rows,
+            dim3((D+255)/256, total_tok), dim3(256), 0, stream,
+            rot_p, xg_p, mst_p, D, total_tok);
 
-        MOE_RECORD(4);  // after gather
+        MOE_RECORD(4);
 
-        moe_out.zero_();
+        // 5. Zero moe output (hipMemset, no ATen)
+        hipMemsetAsync(reinterpret_cast<__half*>(moe_out.data_ptr()), 0, M * D * sizeof(__half), stream);
 
 
         // --- Expert GEMMs: hybrid W4A4 (small M) / dequant+rocBLAS (large M) ---
@@ -1874,7 +2016,7 @@ torch::Tensor prefill_moe_logits(
                 reinterpret_cast<const __half*>(xq_gu_sc.data_ptr()),
                 exp_gu_w[li].data_ptr<uint8_t>(),
                 reinterpret_cast<const __half*>(exp_gu_s[li].data_ptr()),
-                gu_out_p, eid_all_p, eoff_p, ecnt_p,
+                gu_out_p, eid_all_p, moff_p, mcnt_p,
                 gu_packed_stride, gu_scales_stride, N_gu, K_gu);
 
             const int MAX_BATCH = 32768;
@@ -1905,7 +2047,7 @@ torch::Tensor prefill_moe_logits(
                 reinterpret_cast<const __half*>(xq_dn_sc.data_ptr()),
                 exp_dn_w[li].data_ptr<uint8_t>(),
                 reinterpret_cast<const __half*>(exp_dn_s[li].data_ptr()),
-                dn_out_p, eid_all_p, eoff_p, ecnt_p,
+                dn_out_p, eid_all_p, moff_p, mcnt_p,
                 dn_packed_stride, dn_scales_stride, N_dn, K_dn);
 
         } else {
@@ -1914,8 +2056,8 @@ torch::Tensor prefill_moe_logits(
             // Read counts/offsets on CPU ONCE outside layer loop (pre-sync before first layer)
             // For now: use hipMemcpy sync (TODO: eliminate by launching all experts unconditionally)
             int h_counts[128], h_offsets[128];
-            hipMemcpyAsync(h_counts, ecnt_p, E * sizeof(int), hipMemcpyDeviceToHost, stream);
-            hipMemcpyAsync(h_offsets, eoff_p, E * sizeof(int), hipMemcpyDeviceToHost, stream);
+            hipMemcpyAsync(h_counts, mcnt_p, E * sizeof(int), hipMemcpyDeviceToHost, stream);
+            hipMemcpyAsync(h_offsets, moff_p, E * sizeof(int), hipMemcpyDeviceToHost, stream);
             hipStreamSynchronize(stream);
 
             auto* gu_w_p = reinterpret_cast<__half*>(lm_w_tmp.data_ptr());
@@ -1981,16 +2123,14 @@ torch::Tensor prefill_moe_logits(
             if (!moe_f32_buf.defined() || moe_f32_buf.numel() < (long)M * D) {
                 moe_f32_buf = torch::zeros({(long)M, (long)D}, torch::dtype(torch::kFloat32).device(device));
             } else {
-                moe_f32_buf.narrow(0, 0, M).zero_();
+                hipMemsetAsync(moe_f32_buf.data_ptr<float>(), 0, M * D * sizeof(float), stream);
             }
             auto* moe_f32_p = moe_f32_buf.data_ptr<float>();
 
             int64_t scatter_total = (int64_t)total_tok * D;
             int scatter_blocks = (scatter_total + 255) / 256;
             hipLaunchKernelGGL(weighted_scatter_add_f32, dim3(scatter_blocks), dim3(256), 0, stream,
-                moe_f32_p, dn_out_p,
-                reinterpret_cast<const __half*>(sorted_weight.data_ptr()),
-                sorted_token.data_ptr<int64_t>(), D, total_tok);
+                moe_f32_p, dn_out_p, msw_p, mst_p, D, total_tok);
 
             // Convert float32 accumulator to FP16 moe_out
             auto* moe_hp = reinterpret_cast<__half*>(moe_out.data_ptr());
