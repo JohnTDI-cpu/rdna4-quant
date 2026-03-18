@@ -2,6 +2,7 @@
  * INT4 Decode Step V2 — Production-only extract
  * MoE decode (graph + non-graph) + prefill, no debug/coop/hybrid code.
  */
+#include "swmmac_gemm.hip"  // SWMMAC/WMMA INT4 GEMM kernels
 
 #include <hip/hip_runtime.h>
 #include <chrono>
@@ -5506,4 +5507,70 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 reinterpret_cast<__half*>(output.data_ptr()), M, M_pad, (int)N_pad, (int)K);
         }
     }, "Symmetric WMMA INT4 GEMM — zero scale correction in inner loop. ~5x faster than asymmetric.");
+
+    // SWMMAC 2:4 Sparse INT4 GEMM — 477 TOPS raw on R9700
+    m.def("swmmac_gemm", [](
+        torch::Tensor input,          // [M, K] FP16
+        torch::Tensor wt_sparse,      // [N, K/4] compressed 2:4 weights
+        torch::Tensor wt_index,       // [N, ng, 2] pre-packed short indices
+        torch::Tensor w_scales,       // [ng, N_pad] float32 transposed
+        torch::Tensor output,         // [M, N_pad] FP16
+        int64_t N_pad, int64_t K, int64_t group_size
+    ) {
+        int M = input.size(0);
+        int M_pad = ((M + 15) / 16) * 16;
+        int ng = K / group_size;
+        auto device = input.device();
+        auto stream = at::hip::getCurrentHIPStream();
+
+        // Quantize activations (signed symmetric)
+        auto act_q = torch::empty({M_pad, K/2}, torch::dtype(torch::kUInt8).device(device));
+        auto act_scales = torch::empty({M_pad, (long)ng}, torch::dtype(torch::kFloat32).device(device));
+        hipLaunchKernelGGL(swmmac_quantize_act, dim3(ng, M_pad), dim3(32), 0, stream,
+            reinterpret_cast<const __half*>(input.data_ptr()),
+            act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(), M, K, (int)group_size);
+
+        // SWMMAC GEMM
+        dim3 grid((N_pad + 63) / 64, (M + 15) / 16);
+        if (group_size == 64) {
+            hipLaunchKernelGGL((swmmac_gemm_kernel<64>), grid, dim3(32), 0, stream,
+                act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(),
+                wt_sparse.data_ptr<uint8_t>(), wt_index.data_ptr<short>(),
+                w_scales.data_ptr<float>(),
+                reinterpret_cast<__half*>(output.data_ptr()), M, (int)N_pad, (int)K);
+        } else {
+            hipLaunchKernelGGL((swmmac_gemm_kernel<32>), grid, dim3(32), 0, stream,
+                act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(),
+                wt_sparse.data_ptr<uint8_t>(), wt_index.data_ptr<short>(),
+                w_scales.data_ptr<float>(),
+                reinterpret_cast<__half*>(output.data_ptr()), M, (int)N_pad, (int)K);
+        }
+    }, "SWMMAC 2:4 Sparse INT4 GEMM — 477 TOPS peak, signed symmetric.");
+
+    // Dense WMMA GEMM (from swmmac_gemm.hip)
+    m.def("wmma_dense_gemm", [](
+        torch::Tensor input,
+        torch::Tensor wt_tiled,
+        torch::Tensor w_scales,
+        torch::Tensor output,
+        int64_t N_pad, int64_t K, int64_t group_size
+    ) {
+        int M = input.size(0);
+        int M_pad = ((M + 15) / 16) * 16;
+        int ng = K / group_size;
+        auto device = input.device();
+        auto stream = at::hip::getCurrentHIPStream();
+
+        auto act_q = torch::empty({M_pad, K/2}, torch::dtype(torch::kUInt8).device(device));
+        auto act_scales = torch::empty({M_pad, (long)ng}, torch::dtype(torch::kFloat32).device(device));
+        hipLaunchKernelGGL(swmmac_quantize_act, dim3(ng, M_pad), dim3(32), 0, stream,
+            reinterpret_cast<const __half*>(input.data_ptr()),
+            act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(), M, K, (int)group_size);
+
+        dim3 grid((N_pad + 63) / 64, (M + 15) / 16);
+        hipLaunchKernelGGL((wmma_dense_gemm_kernel<(int)64>), grid, dim3(32), 0, stream,
+            act_q.data_ptr<uint8_t>(), act_scales.data_ptr<float>(),
+            wt_tiled.data_ptr<uint8_t>(), w_scales.data_ptr<float>(),
+            reinterpret_cast<__half*>(output.data_ptr()), M, (int)N_pad, (int)K);
+    }, "Dense WMMA INT4 GEMM from swmmac_gemm.hip.");
 }
