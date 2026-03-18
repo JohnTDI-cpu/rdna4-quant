@@ -2315,7 +2315,7 @@ torch::Tensor prefill_moe_logits(
                 reinterpret_cast<const __half*>(exp_gu_s[li].data_ptr()),
                 gu_out_p, eid_all_p, moff_p, mcnt_p,
                 gu_packed_stride, gu_scales_stride, N_gu, K_gu);
-        } else if (M <= 1024) {  // WMMA batched expert dispatch — zero CPU sync, best for M=512-1024
+        } else if (M <= 2048) {  // WMMA batched expert dispatch — zero CPU sync
             // Quantize activations to signed symmetric INT4
             int gu_ng = K_gu / 32;
             hipLaunchKernelGGL(swmmac_quantize_act,
