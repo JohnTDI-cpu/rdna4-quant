@@ -207,6 +207,8 @@ hip_exp_dn_w = []   # [E, hidden, moe_inter/2] uint8
 hip_exp_dn_s = []   # [E, nit_dn, hidden, 2] FP16 — transposed interleaved scale+zero
 hip_exp_gu_wsum = []  # W4A4 disabled — empty list triggers FP16 fallback in C++
 hip_exp_dn_wsum = []
+hip_exp_gu_w_tiled = []  # Not used (tiling done in C++)
+hip_exp_dn_w_tiled = []  # Not used
 
 # Load FP16 attention from original model
 _sf_cache = {}
@@ -278,6 +280,8 @@ for li in range(num_layers):
     hip_exp_dn_w.append(edn_packed)
     dn_sz = interleave_scale_zero_3d_rowmajor(ld['exp_dn_scales'].half(), ld['exp_dn_zeros'])
     hip_exp_dn_s.append(dn_sz.to(device))
+
+    # Note: expert weights stay row-major. Tiling is done in C++ (lazy, on first prefill).
 
     del ld
     gc.collect()

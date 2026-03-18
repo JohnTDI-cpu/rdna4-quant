@@ -422,8 +422,8 @@ __global__ __launch_bounds__(32, 4)  // 64N tile, 4 blocks/CU
 void wmma_expert_batched(
     const uint8_t* __restrict__ act_q,      // [total_tok, K/2] pre-quantized INT4
     const float* __restrict__ act_scales,    // [total_tok, ng]
-    const uint8_t* __restrict__ wt_base,    // [E, N, K/2] packed (row-major per expert)
-    const __half* __restrict__ ws_base,     // [E, N, K/GS, 2] interleaved (scale, zero) per expert
+    const uint8_t* __restrict__ wt_base,    // [E, N, K/2] row-major packed
+    const __half* __restrict__ ws_base,     // [E, N, K/GS, 2] interleaved (scale, zero)
     __half* __restrict__ output,             // [total_tok, N]
     const int* __restrict__ expert_ids,      // [E] identity map (0,1,...,E-1)
     const int* __restrict__ offsets,          // [E] token offsets per expert
@@ -466,6 +466,7 @@ void wmma_expert_batched(
                 a_sc = act_scales[m_idx * ng + g];
             } else { A = (_v2i){}; }
 
+            // Row-major weight load: W is [N, K/2] per expert
             #define LOAD_W(ti) _v2i B##ti; { \
                 int n_row = n_start + ti*16 + nl; \
                 if (n_row < N) { \

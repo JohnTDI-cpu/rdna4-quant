@@ -2133,11 +2133,13 @@ torch::Tensor prefill_moe_logits(
     for (int li = 0; li < num_layers; li++)
         gate_wp[li] = reinterpret_cast<const __half*>(gate_w[li].data_ptr());
 
-    // Strides for expert weight indexing (constant across layers)
+    // Strides for expert weight indexing
     int64_t gu_packed_stride = (int64_t)N_gu * (K_gu / 2);
     int64_t gu_scales_stride = (int64_t)(K_gu / 64) * N_gu * 2;
     int64_t dn_packed_stride = (int64_t)N_dn * (K_dn / 2);
     int64_t dn_scales_stride = (int64_t)(K_dn / 64) * N_dn * 2;
+
+    // Note: expert weights stay row-major (tiling would need 13.5 GB extra VRAM or 123ms/prefill overhead)
 
     // Layer loop
     for (int li = 0; li < num_layers; li++) {
@@ -2352,7 +2354,7 @@ torch::Tensor prefill_moe_logits(
                 wmma_gu_sc.data_ptr<float>(),
                 total_tok, K_gu, 32);
 
-            // WMMA expert batched GEMM — all 128 experts, zero sync
+            // WMMA expert batched GEMM — row-major weights (no tiling — VRAM constrained)
             hipLaunchKernelGGL((wmma_expert_batched<64>),
                 dim3((N_gu + 63) / 64, E), dim3(32), 0, stream,
                 reinterpret_cast<const uint8_t*>(xq_gu_buf.data_ptr()),
