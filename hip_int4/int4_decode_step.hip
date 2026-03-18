@@ -2236,7 +2236,7 @@ torch::Tensor prefill_moe_logits(
 
         // 7. MoE FFN — with optional per-phase timing on layer 0
         hipEvent_t moe_ev[8];
-        bool do_moe_profile = false;  // Set true for profiling
+        bool do_moe_profile = false;  // Profile layer 0
         if (do_moe_profile) for (auto& e : moe_ev) hipEventCreate(&e);
 
         #define MOE_RECORD(idx) if (do_moe_profile) hipEventRecord(moe_ev[idx], stream)
@@ -2298,7 +2298,7 @@ torch::Tensor prefill_moe_logits(
         auto* rot_silu_p = reinterpret_cast<__half*>(rot_silu_buf.data_ptr());
 
         if (M <= 256) {
-            // Small M: W4A4 DOT8 (low overhead, no WMMA padding waste)
+            // Small M: W4A4 DOT8 — complete GU + SiLU + Had + DN
             int gu_groups = total_tok * (K_gu / 32);
             hipLaunchKernelGGL(quantize_activations_u4_v2,
                 dim3((gu_groups + 7) / 8), dim3(256), 0, stream,
@@ -2315,7 +2315,34 @@ torch::Tensor prefill_moe_logits(
                 reinterpret_cast<const __half*>(exp_gu_s[li].data_ptr()),
                 gu_out_p, eid_all_p, moff_p, mcnt_p,
                 gu_packed_stride, gu_scales_stride, N_gu, K_gu);
-        } else if (M <= 2048) {  // WMMA batched expert dispatch — zero CPU sync
+            const int MAX_BATCH = 32768;
+            for (int t_start = 0; t_start < total_tok; t_start += MAX_BATCH) {
+                int t_batch = std::min(MAX_BATCH, total_tok - t_start);
+                __half* gu_batch = gu_out_p + (int64_t)t_start * N_gu;
+                __half* silu_batch = silu_p + (int64_t)t_start * inter;
+                hipLaunchKernelGGL(silu_mul_batched,
+                    dim3((inter + 255) / 256, t_batch), dim3(256), 0, stream,
+                    gu_batch, gu_batch + inter, silu_batch, inter, N_gu, inter);
+                __half* rot_batch = rot_silu_p + (int64_t)t_start * K_dn;
+                launch_hadamard_batched(silu_batch, rot_batch, had_p, t_batch, K_dn, stream);
+            }
+            MOE_RECORD(5);
+            int dn_groups = total_tok * (K_dn / 32);
+            hipLaunchKernelGGL(quantize_activations_u4_v2,
+                dim3((dn_groups + 7) / 8), dim3(256), 0, stream,
+                rot_silu_p,
+                reinterpret_cast<uint8_t*>(xq_dn_buf.data_ptr()),
+                reinterpret_cast<__half*>(xq_dn_sc.data_ptr()),
+                total_tok, K_dn);
+            hipLaunchKernelGGL((gemv_w4a4_udot8_v3<BN, BM>),
+                dim3((N_dn + BN - 1) / BN, E), dim3(32), 0, stream,
+                reinterpret_cast<const uint8_t*>(xq_dn_buf.data_ptr()),
+                reinterpret_cast<const __half*>(xq_dn_sc.data_ptr()),
+                exp_dn_w[li].data_ptr<uint8_t>(),
+                reinterpret_cast<const __half*>(exp_dn_s[li].data_ptr()),
+                dn_out_p, eid_all_p, moff_p, mcnt_p,
+                dn_packed_stride, dn_scales_stride, N_dn, K_dn);
+        } else if (M <= 2048) {  // WMMA batched expert — GU + SiLU + Had + DN
             // Quantize activations to signed symmetric INT4
             int gu_ng = K_gu / 32;
             hipLaunchKernelGGL(swmmac_quantize_act,
