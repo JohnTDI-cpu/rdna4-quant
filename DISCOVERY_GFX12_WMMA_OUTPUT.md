@@ -1,5 +1,5 @@
 # Practical Guide: gfx12 (RDNA4) WMMA Output Lane Mapping
-
+Update (March 2026): AMD confirmed this finding and is working on updating the GPUOpen documentation to explicitly state the lane-to-column mapping convention. The CUDA/SASS comparison in this document has been corrected — the accurate comparison is PTX vs HIP intrinsics, not CUDA vs ROCm at the ISA level.
 ## TL;DR
 
 The `v_wmma_f32_16x16x16_f16` instruction on RDNA4 (gfx12) uses a **column-distributed fragment layout**: lanes index columns, accumulator registers index rows. This can be expressed as:
