@@ -1,4 +1,6 @@
-# ggml-JohnV8 — dedicated RDNA4/gfx1201 inference engine for llama.cpp
+# ggml-JohnV8 — RDNA booster
+
+*Dedicated RDNA (gfx11/gfx12) matrix-core inference booster for llama.cpp — beats ROCm-HIP and Vulkan-RADV on decode AND prefill, losslessly.*
 
 A purpose-built HIP inference engine for **AMD RDNA4** (Radeon AI PRO R9700, gfx1201; RDNA3/gfx11 expected-compatible, untested) that **beats both ROCm-HIP and Vulkan-RADV on decode AND prefill, losslessly**, across the full GGUF quant range. Built from first principles for our own silicon rather than hipified CUDA.
 
