@@ -45,7 +45,22 @@ Definitive baseline of **what ggml-JohnV8 must beat** on prefill. Measured fresh
 | **Q8_0** | ROCm | **2951** | **3214** | **3166** | **3067** | **2887** | **2581** |
 | | RADV | 2557 | 2878 | 2838 | 2757 | 2597 | 2322 |
 
-*(Bold = faster backend. 16384/32768 appended below when sweep completes.)*
+*(Bold = faster backend.)*
+
+### Long context (pp16384, pp32768; -r 2)
+
+| Quant | ROCm 16k | RADV 16k | ROCm 32k | RADV 32k |
+|---|---|---|---|---|
+| Q4_0 | **2155** | 2097 | 1532 | 1532 |
+| Q4_K_M | 1829 | **1867** | 1360 | **1400** |
+| Q5_K_M | 1766 | **1827** | 1323 | **1376** |
+| Q5_K | **1876** | 1849 | 792¹ | **1389** |
+| Q6_K | 1301 | **1694** | 1042 | **1298** |
+| Q8_0 | **2138** | 1958 | **1523** | 1449 |
+
+¹ Q5_K ROCm 32k = glitch (-r 2 outlier).
+
+At long context the attention O(N²) dominates → all drop. Pattern holds: ROCm wins simple (Q4_0/Q8), RADV wins K-quants. Q6_K RADV still +30-25% over ROCm at 16k/32k.
 
 ## Best-of-both = the bar to beat (@ pp512)
 
