@@ -3,6 +3,7 @@
  * MoE decode (graph + non-graph) + prefill, no debug/coop/hybrid code.
  */
 #include "swmmac_engine.hip"  // Native RDNA4 SWMMAC/WMMA INT4 engine
+#include "flash_prefill.hip"  // FlashAttention v2 prefill forward (FP16, GQA, causal)
 
 #include <hip/hip_runtime.h>
 #include <chrono>
@@ -311,42 +312,58 @@ __global__ __launch_bounds__(128, 4) void gemv_multiwave_rm_g64(
     __half* __restrict__ Y,
     int N, int K
 ) {
+    const int warps_per_block = blockDim.x / 32;
     const int warp_id = threadIdx.x / 32;
     const int lane    = threadIdx.x % 32;
-    const int n0      = (blockIdx.x * 4 + warp_id) * ROWS_PER_WARP;
+    const int n0      = (blockIdx.x * warps_per_block + warp_id) * ROWS_PER_WARP;
     const int nit     = K / 32;
     float acc[ROWS_PER_WARP];
     #pragma unroll
     for (int i = 0; i < ROWS_PER_WARP; i++) acc[i] = 0.0f;
 
-    for (int it = lane; it < nit; it += 32) {
-        if (n0 >= N) continue;
-        const __half* Xit = X + it * 32;
+    const int Kh = K / 2;
+    const int nsc = nit >> 1;
 
-        // Load weight + fused dot+x_sum in single pass (X loaded once from L0)
-        const uint8_t* wr = W + (int64_t)n0 * (K / 2) + it * 16;
-        uint4 w128 = *reinterpret_cast<const uint4*>(wr);
-        const uint8_t* wp = reinterpret_cast<const uint8_t*>(&w128);
-        float raw_dot = 0.0f, x_sum = 0.0f;
+    if (n0 >= N) return;
+
+    for (int it = lane; it < nit; it += 32) {
+        const __half* Xit = X + it * 32;
+        float x_sum = 0.0f;
+        float xv[32];
         #pragma unroll
         for (int b = 0; b < 16; b++) {
-            uint8_t p = wp[b];
             float2 xf = __half22float2(*reinterpret_cast<const __half2*>(&Xit[b * 2]));
-            raw_dot += xf.x * (float)(p & 0xF) + xf.y * (float)((p >> 4) & 0xF);
+            xv[b*2] = xf.x; xv[b*2+1] = xf.y;
             x_sum += xf.x + xf.y;
         }
 
-        // Row-major scale layout: S[N, K/64, 2] — coalesced across K groups within warp
         int g = it >> 1;
-        __half2 sz = *reinterpret_cast<const __half2*>(&S[((int64_t)n0 * (nit >> 1) + g) * 2]);
-        float sc = __half2float(sz.x);
-        float zp = __half2float(sz.y);
-        acc[0] += sc * (raw_dot - zp * x_sum);
+        #pragma unroll
+        for (int ni = 0; ni < ROWS_PER_WARP; ni++) {
+            int n = n0 + ni;
+            if (n >= N) continue;
+            const uint8_t* wr = W + (int64_t)n * Kh + it * 16;
+            uint4 w128 = *reinterpret_cast<const uint4*>(wr);
+            const uint8_t* wp = reinterpret_cast<const uint8_t*>(&w128);
+            __half2 sz = *reinterpret_cast<const __half2*>(&S[((int64_t)n * nsc + g) * 2]);
+            float sc = __half2float(sz.x);
+            float zp = __half2float(sz.y);
+            float raw_dot = 0.0f;
+            #pragma unroll
+            for (int b = 0; b < 16; b++) {
+                uint8_t p = wp[b];
+                raw_dot += xv[b*2] * (float)(p & 0xF) + xv[b*2+1] * (float)((p >> 4) & 0xF);
+            }
+            acc[ni] += sc * (raw_dot - zp * x_sum);
+        }
     }
-    acc[0] += __shfl_xor(acc[0], 16); acc[0] += __shfl_xor(acc[0], 8);
-    acc[0] += __shfl_xor(acc[0], 4);  acc[0] += __shfl_xor(acc[0], 2);
-    acc[0] += __shfl_xor(acc[0], 1);
-    if (lane == 0 && n0 < N) Y[n0] = __float2half(acc[0]);
+    #pragma unroll
+    for (int ni = 0; ni < ROWS_PER_WARP; ni++) {
+        acc[ni] += __shfl_xor(acc[ni], 16); acc[ni] += __shfl_xor(acc[ni], 8);
+        acc[ni] += __shfl_xor(acc[ni], 4);  acc[ni] += __shfl_xor(acc[ni], 2);
+        acc[ni] += __shfl_xor(acc[ni], 1);
+        if (lane == 0 && n0 + ni < N) Y[n0 + ni] = __float2half(acc[ni]);
+    }
 }
 
 // Launch multi-warp GEMV: 4 warps/block × 2 rows/warp → 8 rows/block
@@ -379,9 +396,10 @@ void gemv_mw_rm_g64_splitk(
     float* __restrict__ Y_parts,     // [N] float accumulator (atomicAdd)
     int N, int K, int n_splits
 ) {
+    const int warps_per_block = blockDim.x / 32;
     const int warp_id = threadIdx.x / 32;
     const int lane    = threadIdx.x % 32;
-    const int n0      = (blockIdx.x * 4 + warp_id) * ROWS_PER_WARP;
+    const int n0      = (blockIdx.x * warps_per_block + warp_id) * ROWS_PER_WARP;
     const int split_id = blockIdx.y;
 
     const int nit     = K / 32;
@@ -1130,6 +1148,7 @@ void gemv_w4a4_udot8_v3(
     const int n0   = blockIdx.x * BN;
     const int lane = threadIdx.x;
     const int nit  = K / 32;
+    const int nsc  = nit >> 1;  // K/64
 
     // Process tokens in tiles of BM
     for (int m0 = 0; m0 < M_j; m0 += BM) {
@@ -1145,12 +1164,20 @@ void gemv_w4a4_udot8_v3(
         // K-outer loop: load W once, process all tokens in M-tile
         for (int it = lane; it < nit; it += 32) {
             // Load weight scales (same for all tokens) — 64-element groups
-            constexpr int SZ = (BN + 3) / 4;
-            __half sz[SZ * 8];
+            // Row-major [N, K/64, 2] format: S[(n * nsc + g) * 2]
+            __half sz[BN * 2];
+            const int g = it >> 1;
             #pragma unroll
-            for (int sl = 0; sl < SZ; sl++)
-                *reinterpret_cast<uint4*>(&sz[sl * 8]) =
-                    *reinterpret_cast<const uint4*>(&S[((it >> 1) * N + n0 + sl * 4) * 2]);
+            for (int ni = 0; ni < BN; ni++) {
+                if (n0 + ni < N) {
+                    __half2 sv = *reinterpret_cast<const __half2*>(&S[((int64_t)(n0 + ni) * nsc + g) * 2]);
+                    sz[ni * 2] = sv.x;
+                    sz[ni * 2 + 1] = sv.y;
+                } else {
+                    sz[ni * 2] = __float2half(0.0f);
+                    sz[ni * 2 + 1] = __float2half(0.0f);
+                }
+            }
 
             // Load W for BN rows at this K-chunk — reused across all tokens
             uint4 w128[BN];
@@ -2139,7 +2166,7 @@ torch::Tensor prefill_moe_logits(
     int64_t dn_packed_stride = (int64_t)N_dn * (K_dn / 2);
     int64_t dn_scales_stride = (int64_t)(K_dn / 64) * N_dn * 2;
 
-    // Note: expert weights stay row-major (tiling would need 13.5 GB extra VRAM or 123ms/prefill overhead)
+    // Expert scales: [E, N, K/64, 2] row-major (all kernels now read row-major directly)
 
     // Layer loop
     for (int li = 0; li < num_layers; li++) {
@@ -2299,7 +2326,8 @@ torch::Tensor prefill_moe_logits(
         auto* silu_p = reinterpret_cast<__half*>(silu_buf.data_ptr());
         auto* rot_silu_p = reinterpret_cast<__half*>(rot_silu_buf.data_ptr());
 
-        if (false) {  // W4A4 DISABLED — weights now in TILED format for WMMA
+        if (M <= 256) {
+            // Small M: W4A4 DOT8 — complete GU + SiLU + Had + DN
             int gu_groups = total_tok * (K_gu / 32);
             hipLaunchKernelGGL(quantize_activations_u4_v2,
                 dim3((gu_groups + 7) / 8), dim3(256), 0, stream,
@@ -2343,18 +2371,20 @@ torch::Tensor prefill_moe_logits(
                 reinterpret_cast<const __half*>(exp_dn_s[li].data_ptr()),
                 dn_out_p, eid_all_p, moff_p, mcnt_p,
                 dn_packed_stride, dn_scales_stride, N_dn, K_dn);
-        } else if (M <= 2048) {  // WMMA batched expert — GU + SiLU + Had + DN
-            // Quantize activations to signed symmetric INT4
-            int gu_ng = K_gu / 32;
+        } else if (false && M <= 2048) {  // DISABLED: WMMA unsigned asymmetric WIP
+            // No pre-tiling needed — wmma_expert_batched_lds reads from row-major directly
+            // with correct 2-WMMA-per-weight-group K coverage
+
+            // Quantize GU activations
             hipLaunchKernelGGL(swmmac_quantize_act,
-                dim3(gu_ng, ((total_tok + 15) / 16) * 16), dim3(32), 0, stream,
+                dim3(K_gu / 32, ((total_tok + 15) / 16) * 16), dim3(32), 0, stream,
                 reinterpret_cast<const __half*>(xg_p),
                 reinterpret_cast<uint8_t*>(xq_gu_buf.data_ptr()),
                 wmma_gu_sc.data_ptr<float>(),
                 total_tok, K_gu, 32);
 
-            // WMMA expert batched GEMM — row-major weights (no tiling — VRAM constrained)
-            hipLaunchKernelGGL((wmma_expert_batched<64>),
+            // GU WMMA expert batched — row-major weights, correct K coverage
+            hipLaunchKernelGGL(wmma_expert_batched_lds,
                 dim3((N_gu + 63) / 64, E), dim3(32), 0, stream,
                 reinterpret_cast<const uint8_t*>(xq_gu_buf.data_ptr()),
                 wmma_gu_sc.data_ptr<float>(),
@@ -2377,16 +2407,15 @@ torch::Tensor prefill_moe_logits(
 
             MOE_RECORD(5);
 
-            // DN WMMA expert batched GEMM
-            int dn_ng = K_dn / 32;
+            // DN WMMA expert batched — quantize + compute
             hipLaunchKernelGGL(swmmac_quantize_act,
-                dim3(dn_ng, ((total_tok + 15) / 16) * 16), dim3(32), 0, stream,
+                dim3(K_dn / 32, ((total_tok + 15) / 16) * 16), dim3(32), 0, stream,
                 reinterpret_cast<const __half*>(rot_silu_p),
                 reinterpret_cast<uint8_t*>(xq_dn_buf.data_ptr()),
                 wmma_dn_sc.data_ptr<float>(),
                 total_tok, K_dn, 32);
 
-            hipLaunchKernelGGL((wmma_expert_batched<64>),
+            hipLaunchKernelGGL(wmma_expert_batched_lds,
                 dim3((N_dn + 63) / 64, E), dim3(32), 0, stream,
                 reinterpret_cast<const uint8_t*>(xq_dn_buf.data_ptr()),
                 wmma_dn_sc.data_ptr<float>(),
@@ -2531,10 +2560,19 @@ torch::Tensor prefill_moe_logits(
     launch_hadamard_batched(last_n_p, rot_f_p, had_p, 1, D, stream);
 
     // LM head: [1, vocab] instead of [M, vocab] — saves ~9 GB at 32k context
+    // lm_s is [N, K/64, 2] row-major — use dequant_int4_g64_rm_kernel (NOT ts variant!)
     auto logits = torch::empty({1, (long)lm_N}, opts);
-    dequant_matmul_out_g64_ts(rot_final, logits,
-        lm_w.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(lm_s.data_ptr()),
-        (int)lm_N, (int)lm_K, lm_w_tmp, stream);
+    {
+        int lm_total = (int)lm_N * ((int)lm_K / 2);
+        auto w_fp16 = torch::from_blob(lm_w_tmp.data_ptr(), {(long)lm_N, (long)lm_K}, opts);
+        hipLaunchKernelGGL(dequant_int4_g64_rm_kernel,
+            dim3((lm_total + 255) / 256), dim3(256), 0, stream,
+            lm_w.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(lm_s.data_ptr()),
+            reinterpret_cast<__half*>(lm_w_tmp.data_ptr()),
+            (int)lm_N, (int)lm_K);
+        at::mm_out(logits, rot_final, w_fp16.t());
+    }
 
     return logits;  // [1, vocab] (last token only)
 }
@@ -2886,41 +2924,76 @@ __global__ void gemv_mw_batch_g64(
     const __half*  S = S_base + j * scales_stride;
     __half* Y = Y_base + (int64_t)rank * out_stride;
 
+    const int warps_per_block = blockDim.x / 32;
     const int warp_id = threadIdx.x / 32;
     const int lane    = threadIdx.x % 32;
-    const int n0      = (blockIdx.x * 4 + warp_id) * ROWS_PER_WARP;
+    const int n0      = (blockIdx.x * warps_per_block + warp_id) * ROWS_PER_WARP;
     const int nit     = K / 32;
     float acc[ROWS_PER_WARP];
     #pragma unroll
     for (int i = 0; i < ROWS_PER_WARP; i++) acc[i] = 0.0f;
 
-    for (int it = lane; it < nit; it += 32) {
-        if (n0 >= N) continue;
-        const __half* Xit = X + it * 32;
+    const int Kh = K / 2;
+    const int nsc = nit >> 1;  // K/64
 
-        // Fused dot+x_sum: single pass over X from L0 cache
-        const uint8_t* wr = W + (int64_t)n0 * (K / 2) + it * 16;
-        uint4 w128 = *reinterpret_cast<const uint4*>(wr);
-        const uint8_t* wp = reinterpret_cast<const uint8_t*>(&w128);
-        float raw_dot = 0.0f, x_sum = 0.0f;
+    if (n0 >= N) return;
+
+    for (int it = lane; it < nit; it += 32) {
+        // LLPC-style: load X and W interleaved, FMA immediately, no xv[] cache.
+        // Precompute scale+zero for all neurons FIRST (hoist out of dot loop)
+        float sc[ROWS_PER_WARP], zp_sc[ROWS_PER_WARP];
         #pragma unroll
-        for (int b = 0; b < 16; b++) {
-            uint8_t p = wp[b];
-            float2 xf = __half22float2(*reinterpret_cast<const __half2*>(&Xit[b * 2]));
-            raw_dot += xf.x * (float)(p & 0xF) + xf.y * (float)((p >> 4) & 0xF);
-            x_sum += xf.x + xf.y;
+        for (int ni = 0; ni < ROWS_PER_WARP; ni++) {
+            int n = n0 + ni;
+            if (n < N) {
+                __half2 sz = *reinterpret_cast<const __half2*>(&S[((int64_t)n * nsc + (it >> 1)) * 2]);
+                sc[ni] = __half2float(sz.x);
+                zp_sc[ni] = __half2float(sz.y) * sc[ni];  // precompute zp*sc
+            }
         }
 
-        // Scale correction (row-major scale format)
-        __half2 sz = *reinterpret_cast<const __half2*>(&S[((int64_t)n0 * (nit >> 1) + (it >> 1)) * 2]);
-        float sc = __half2float(sz.x);
-        float zp = __half2float(sz.y);
-        acc[0] += sc * (raw_dot - zp * x_sum);
+        // Load weights for all neurons upfront (coalesced)
+        uint4 w128[ROWS_PER_WARP];
+        #pragma unroll
+        for (int ni = 0; ni < ROWS_PER_WARP; ni++) {
+            int n = n0 + ni;
+            if (n < N) {
+                w128[ni] = *reinterpret_cast<const uint4*>(W + (int64_t)n * Kh + it * 16);
+            }
+        }
+
+        // Stream through X once, accumulate into all neurons via FMA
+        const __half* Xit = X + it * 32;
+        float x_sum = 0.0f;
+        float raw_dot[ROWS_PER_WARP] = {};
+
+        #pragma unroll
+        for (int b = 0; b < 16; b++) {
+            float2 xf = __half22float2(*reinterpret_cast<const __half2*>(&Xit[b * 2]));
+            x_sum += xf.x + xf.y;
+            #pragma unroll
+            for (int ni = 0; ni < ROWS_PER_WARP; ni++) {
+                const uint8_t* wp = reinterpret_cast<const uint8_t*>(&w128[ni]);
+                uint8_t p = wp[b];
+                raw_dot[ni] = __fmaf_rn(xf.x, (float)(p & 0xF), raw_dot[ni]);
+                raw_dot[ni] = __fmaf_rn(xf.y, (float)((p >> 4) & 0xF), raw_dot[ni]);
+            }
+        }
+
+        // Final: acc += sc * raw_dot - zp_sc * x_sum  (2 FMA instead of 3 ops)
+        #pragma unroll
+        for (int ni = 0; ni < ROWS_PER_WARP; ni++) {
+            if (n0 + ni < N)
+                acc[ni] = __fmaf_rn(sc[ni], raw_dot[ni], __fmaf_rn(-zp_sc[ni], x_sum, acc[ni]));
+        }
     }
-    acc[0] += __shfl_xor(acc[0], 16); acc[0] += __shfl_xor(acc[0], 8);
-    acc[0] += __shfl_xor(acc[0], 4);  acc[0] += __shfl_xor(acc[0], 2);
-    acc[0] += __shfl_xor(acc[0], 1);
-    if (lane == 0 && n0 < N) Y[n0] = __float2half(acc[0]);
+    #pragma unroll
+    for (int ni = 0; ni < ROWS_PER_WARP; ni++) {
+        acc[ni] += __shfl_xor(acc[ni], 16); acc[ni] += __shfl_xor(acc[ni], 8);
+        acc[ni] += __shfl_xor(acc[ni], 4);  acc[ni] += __shfl_xor(acc[ni], 2);
+        acc[ni] += __shfl_xor(acc[ni], 1);
+        if (lane == 0 && n0 + ni < N) Y[n0 + ni] = __float2half(acc[ni]);
+    }
 }
 // ============================================================
 // Batched SiLU + FWHT kernel (separated from GEMV for lower VGPR pressure).
@@ -2956,6 +3029,92 @@ __global__ void silu_fwht_batch(
     val *= 0.17677669529663689f;  // 1/sqrt(32)
 
     Out[lane] = __float2half(val);
+}
+// ============================================================
+// Fused SiLU+FWHT+DN GEMV: reads raw GU output (gate||up), applies SiLU(gate)*up,
+// FWHT via warp shuffles, then dot-product with DN weights. Saves 1 kernel launch.
+// X_base layout: [k, 2*K_dn] where [:K_dn]=gate, [K_dn:]=up
+// ============================================================
+template<int BLOCK_N>
+__global__ __launch_bounds__(32, 2) void gemv_warp_batch_xbatch_g64_fused_silu(
+    const __half*   __restrict__ GU_base,  // [k, 2*K_dn] — gate in [:K], up in [K:]
+    const uint8_t*  __restrict__ W_base,
+    const __half*   __restrict__ S_base,
+    __half* __restrict__ Y_base,
+    const int64_t*  __restrict__ tids,
+    int64_t gu_stride,                     // 2*K_dn
+    int64_t packed_stride, int64_t scales_stride, int64_t out_stride,
+    int N, int K
+) {
+    int rank = blockIdx.y;
+    int64_t j = tids[rank];
+    const __half*  Gate = GU_base + (int64_t)rank * gu_stride;
+    const __half*  Up   = Gate + K;
+    const uint8_t* W = W_base + j * packed_stride;
+    const __half*  S = S_base + j * scales_stride;
+    __half* Y = Y_base + (int64_t)rank * out_stride;
+
+    const int n0   = blockIdx.x * BLOCK_N;
+    const int lane = threadIdx.x;
+    const int nit  = K / 32;
+    float acc[BLOCK_N];
+    #pragma unroll
+    for (int i = 0; i < BLOCK_N; i++) acc[i] = 0.0f;
+
+    for (int it = lane; it < nit; it += 32) {
+        // Inline SiLU+FWHT: each lane processes 1 element of 32-element group
+        float g = __half2float(Gate[it * 32 + lane]);
+        float u = __half2float(Up[it * 32 + lane]);
+        float val = g / (1.0f + expf(-g)) * u;
+
+        // FWHT butterfly via warp shuffles
+        #pragma unroll
+        for (int step = 1; step < 32; step *= 2) {
+            float partner = __shfl_xor(val, step);
+            float orig = val;
+            val = (lane & step) ? (partner - orig) : (orig + partner);
+        }
+        val *= 0.17677669529663689f;  // 1/sqrt(32)
+
+        // Gather FWHT output from all lanes into register array (via shuffle)
+        float xv[32];
+        #pragma unroll
+        for (int i = 0; i < 32; i++) {
+            xv[i] = __shfl(val, i);
+        }
+
+        // Standard GEMV dot product with FWHT values
+        const int ngrp = nit >> 1;
+        float x_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 32; i++) x_sum += xv[i];
+
+        #pragma unroll
+        for (int ni = 0; ni < BLOCK_N; ni++) {
+            int n = n0 + ni;
+            if (n >= N) continue;
+            __half2 sz = *reinterpret_cast<const __half2*>(&S[((int64_t)n * ngrp + (it >> 1)) * 2]);
+            float sc = __half2float(sz.x);
+            float zp = __half2float(sz.y);
+            const uint8_t* wr = W + n * (K / 2) + it * 16;
+            uint4 w128 = *reinterpret_cast<const uint4*>(wr);
+            const uint8_t* wp = reinterpret_cast<const uint8_t*>(&w128);
+            float raw_dot = 0.0f;
+            #pragma unroll
+            for (int b = 0; b < 16; b++) {
+                uint8_t p = wp[b];
+                raw_dot += xv[b*2] * (float)(p & 0xF) + xv[b*2+1] * (float)((p >> 4) & 0xF);
+            }
+            acc[ni] += sc * (raw_dot - zp * x_sum);
+        }
+    }
+    #pragma unroll
+    for (int ni = 0; ni < BLOCK_N; ni++) {
+        acc[ni] += __shfl_xor(acc[ni], 16); acc[ni] += __shfl_xor(acc[ni], 8);
+        acc[ni] += __shfl_xor(acc[ni], 4);  acc[ni] += __shfl_xor(acc[ni], 2);
+        acc[ni] += __shfl_xor(acc[ni], 1);
+        if (lane == 0 && n0 + ni < N) Y[n0 + ni] = __float2half(acc[ni]);
+    }
 }
 // ============================================================
 // Group-64 batched GEMV with per-expert input (X_base indexed by rank).
@@ -4984,13 +5143,21 @@ torch::Tensor int4_decode_step_moe_logits(
     // First layer: RMSNorm + FWHT → rot
     launch_rmsnorm_fwht(h, in_np[0], rot, D, rms_eps, stream);
 
+    // Profile events for layer 0
+    hipEvent_t dev[10];
+    bool do_decode_prof = (pos == 128);  // profile first decode step
+    if (do_decode_prof) for (auto& e : dev) hipEventCreate(&e);
+    #define DP(i) if (do_decode_prof && li == 0) hipEventRecord(dev[i], stream)
+
     for (int li = 0; li < num_layers; li++) {
         int Nqkv = qkv_N[li];
         int No   = o_N[li];
 
+        DP(0);
         // 1. QKV GEMV (multi-warp for better bandwidth with small K=2048)
         launch_gemv_mw_rm_g64(rot, qkv_wp[li], qkv_sp[li], qkv, Nqkv, D, stream);
 
+        DP(1);
         // 2. Head RMSNorm + RoPE + FP16 KV write
         __half* q_ptr = qkv;
         __half* k_ptr = qkv + q_dim;
@@ -5003,26 +5170,31 @@ torch::Tensor int4_decode_step_moe_logits(
             cos_pos, sin_pos,
             (int)num_heads, (int)num_kv_heads, (int)head_dim, rms_eps, max_seq, (int)pos);
 
+        DP(2);
         // 3. FP16 flash decode
         launch_flash_decode_fp16(qkv, kc_p[li], vc_p[li], qkv,
             p_max, p_sum, p_out,
             (int)num_heads, (int)num_kv_heads, max_seq, seq_len, (int)head_dim, stream);
 
+        DP(3);
         // 4. O projection
         launch_gemv_mw_rm_g64(qkv, o_wp[li], o_sp[li], obuf, No, q_dim, stream);
 
+        DP(4);
         // 5+6+7. Fused ResNorm+FWHT+Router GEMV+Softmax+TopK (last-block atomic)
         launch_fused_resnorm_router(obuf, h, post_np[li], rot, r,
             gate_wp[li], rlogits, tids, tprobs, rctr,
             D, E, k, rms_eps, stream);
 
+        DP(5);
         // 8. Expert GU GEMV (FP16 scalar dequant — bandwidth-bound, W4A4 adds overhead)
-        hipLaunchKernelGGL((gemv_mw_batch_g64<1>),
-            dim3((N_gu + 3) / 4, k), dim3(128), 0, stream,
+        hipLaunchKernelGGL((gemv_mw_batch_g64<2>),
+            dim3((N_gu + 7) / 8, k), dim3(128), 0, stream,
             rot, egu_wp[li], egu_sp[li], batch_gu, tids,
             gu_packed_stride, gu_scales_stride, N_gu,
             (int)N_gu, (int)K_gu);
 
+        DP(6);
         // Phase 2: SiLU + FWHT (separate, lower VGPR pressure)
         hipLaunchKernelGGL(silu_fwht_batch,
             dim3(K_dn / 32, k), dim3(32), 0, stream,
@@ -5035,10 +5207,24 @@ torch::Tensor int4_decode_step_moe_logits(
             dn_packed_stride, dn_scales_stride, N_dn,
             (int)N_dn, (int)K_dn);
 
+        DP(7);
         // Phase 4: Fused weighted sum + residual + norm + FWHT
         const __half* next_norm = (li < num_layers - 1) ? in_np[li + 1] : in_np[0];
         launch_moe_reduce_norm_fwht(batch_dn, tprobs, r, next_norm, rot, h, k, D, rms_eps, stream);
+        DP(8);
     }
+
+    if (do_decode_prof) {
+        hipStreamSynchronize(stream);
+        float ms[8];
+        const char* names[] = {"QKV", "HeadNorm+RoPE", "FlashDec", "O_proj", "Router+TopK", "GU_GEMV", "SiLU+DN", "Reduce"};
+        for (int i = 0; i < 8; i++) hipEventElapsedTime(&ms[i], dev[i], dev[i+1]);
+        float tot = 0;
+        for (int i = 0; i < 8; i++) { tot += ms[i]; fprintf(stderr, "  %-14s %6.1f µs\n", names[i], ms[i]*1000); }
+        fprintf(stderr, "  Layer total:   %6.1f µs (×48 = %.1f ms = %.0f t/s est)\n", tot*1000, tot*48, 1.0/(tot*48/1000));
+        for (auto& e : dev) hipEventDestroy(e);
+    }
+    #undef DP
 
     // Final norm + FWHT → rot, then LM head GEMV → logits
     const __half* fn_p = reinterpret_cast<const __half*>(final_norm_w.data_ptr());
@@ -5260,8 +5446,8 @@ torch::Tensor decode_step_moe_graph_logits(
             gate_wp[li], rlogits, tids, tprobs, rctr,
             D, E, k, rms_eps, stream);
 
-        hipLaunchKernelGGL((gemv_mw_batch_g64<1>),
-            dim3((N_gu + 3) / 4, k), dim3(128), 0, stream,
+        hipLaunchKernelGGL((gemv_mw_batch_g64<2>),
+            dim3((N_gu + 7) / 8, k), dim3(128), 0, stream,
             rot, egu_wp[li], egu_sp[li], batch_gu, tids,
             gu_packed_stride, gu_scales_stride, N_gu,
             (int)N_gu, (int)K_gu);
@@ -5623,4 +5809,87 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             wt_tiled.data_ptr<uint8_t>(), w_scales.data_ptr<float>(),
             reinterpret_cast<__half*>(output.data_ptr()), M, (int)N_pad, (int)K);
     }, "Dense WMMA INT4 GEMM from swmmac_gemm.hip.");
+
+    // FlashAttention v2 prefill — FP16, GQA, causal. Drop-in replacement SDPA.
+    m.def("flash_prefill_v0", [](
+        torch::Tensor q,   // [1, H, M, D] FP16
+        torch::Tensor k,   // [1, Hk, M, D] FP16
+        torch::Tensor v    // [1, Hk, M, D] FP16
+    ) -> torch::Tensor {
+        TORCH_CHECK(q.dtype() == torch::kFloat16 && k.dtype() == torch::kFloat16 && v.dtype() == torch::kFloat16,
+                    "flash_prefill_v0 wymaga FP16");
+        TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+                    "flash_prefill_v0 wymaga contiguous tensorów");
+        TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "Q/K/V muszą być 4D");
+        int H  = q.size(1);
+        int Hk = k.size(1);
+        int M  = q.size(2);
+        int D  = q.size(3);
+        TORCH_CHECK(D == 128, "v0 wspiera tylko D=128");
+        TORCH_CHECK(H % Hk == 0, "H musi być wielokrotnością Hk dla GQA");
+
+        auto out = torch::empty_like(q);
+        auto stream = at::hip::getCurrentHIPStream();
+        launch_flash_prefill_v0(
+            reinterpret_cast<const __half*>(q.data_ptr()),
+            reinterpret_cast<const __half*>(k.data_ptr()),
+            reinterpret_cast<const __half*>(v.data_ptr()),
+            reinterpret_cast<__half*>(out.data_ptr()),
+            M, H, Hk, D, stream);
+        return out;
+    }, "FA2 prefill v0 (warp-per-Q-row, FP16, causal, GQA) — drop-in SDPA replacement.");
+
+    m.def("flash_prefill_v1", [](
+        torch::Tensor q,   // [1, H, M, D] FP16
+        torch::Tensor k,   // [1, Hk, M, D] FP16
+        torch::Tensor v    // [1, Hk, M, D] FP16
+    ) -> torch::Tensor {
+        TORCH_CHECK(q.dtype() == torch::kFloat16 && k.dtype() == torch::kFloat16 && v.dtype() == torch::kFloat16,
+                    "flash_prefill_v1 wymaga FP16");
+        TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+                    "flash_prefill_v1 wymaga contiguous");
+        TORCH_CHECK(q.dim() == 4, "Q/K/V muszą być 4D");
+        int H  = q.size(1);
+        int Hk = k.size(1);
+        int M  = q.size(2);
+        int D  = q.size(3);
+        TORCH_CHECK(D == 128, "v1 wspiera tylko D=128");
+        TORCH_CHECK(H % Hk == 0, "H musi być wielokrotnością Hk");
+
+        auto out = torch::empty_like(q);
+        auto stream = at::hip::getCurrentHIPStream();
+        launch_flash_prefill_v1(
+            reinterpret_cast<const __half*>(q.data_ptr()),
+            reinterpret_cast<const __half*>(k.data_ptr()),
+            reinterpret_cast<const __half*>(v.data_ptr()),
+            reinterpret_cast<__half*>(out.data_ptr()),
+            M, H, Hk, D, stream);
+        return out;
+    }, "FA2 prefill v1 (FP16 WMMA Q@K^T + P@V, online softmax, causal, GQA).");
+
+    m.def("debug_qkt", [](torch::Tensor q, torch::Tensor k) -> torch::Tensor {
+        TORCH_CHECK(q.size(0) == 16 && q.size(1) == 128, "Q [16,128]");
+        TORCH_CHECK(k.size(0) == 16 && k.size(1) == 128, "K [16,128]");
+        auto out = torch::empty({16, 16}, q.options());
+        auto stream = at::hip::getCurrentHIPStream();
+        launch_debug_qkt(
+            reinterpret_cast<const __half*>(q.data_ptr()),
+            reinterpret_cast<const __half*>(k.data_ptr()),
+            reinterpret_cast<__half*>(out.data_ptr()), stream);
+        return out;
+    }, "Debug: pure Q @ K^T via WMMA (no softmax).");
+
+    m.def("debug_fa_single", [](torch::Tensor q, torch::Tensor k, torch::Tensor v) -> torch::Tensor {
+        TORCH_CHECK(q.size(0) == 16 && q.size(1) == 128, "Q [16,128]");
+        TORCH_CHECK(k.size(0) == 16 && k.size(1) == 128, "K [16,128]");
+        TORCH_CHECK(v.size(0) == 16 && v.size(1) == 128, "V [16,128]");
+        auto out = torch::empty({16, 128}, q.options());
+        auto stream = at::hip::getCurrentHIPStream();
+        launch_debug_fa_single(
+            reinterpret_cast<const __half*>(q.data_ptr()),
+            reinterpret_cast<const __half*>(k.data_ptr()),
+            reinterpret_cast<const __half*>(v.data_ptr()),
+            reinterpret_cast<__half*>(out.data_ptr()), stream);
+        return out;
+    }, "Debug: full FA single tile (no causal).");
 }
