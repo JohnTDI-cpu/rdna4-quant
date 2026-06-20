@@ -1,0 +1,67 @@
+{
+  "ctx": 2048,
+  "model": "/home/janusz/models/Bielik-11B-v2.6-Instruct",
+  "variants": {
+    "1_fp16": {
+      "mode": "fp16",
+      "n_patched": 350,
+      "ppl_en": 6.217060754714241,
+      "ppl_pl": 2.653855265020834,
+      "tok_en": 81880,
+      "win_en": 40,
+      "tok_pl": 81880,
+      "win_pl": 40,
+      "sec": 64.91360473632812
+    },
+    "2_q4k_int8act": {
+      "mode": "q4k_int8",
+      "n_patched": 350,
+      "ppl_en": 6.382999212708305,
+      "ppl_pl": 2.712572276461112,
+      "tok_en": 81880,
+      "win_en": 40,
+      "tok_pl": 81880,
+      "win_pl": 40,
+      "sec": 70.35966515541077
+    },
+    "3_w4a4_qk_had": {
+      "mode": "w4a4_qk_h",
+      "n_patched": 350,
+      "ppl_en": 523.3715053016505,
+      "ppl_pl": 304.96549385125735,
+      "tok_en": 81880,
+      "win_en": 40,
+      "tok_pl": 81880,
+      "win_pl": 40,
+      "sec": 78.25621509552002
+    },
+    "4_w4a4_qk_noH": {
+      "mode": "w4a4_qk",
+      "n_patched": 350,
+      "ppl_en": 6.648256353305374,
+      "ppl_pl": 2.8012629014835624,
+      "tok_en": 81880,
+      "win_en": 40,
+      "tok_pl": 81880,
+      "win_pl": 40,
+      "sec": 69.38014340400696
+    },
+    "5_w4a4_q40_had": {
+      "mode": "w4a4_q40_h",
+      "n_patched": 350,
+      "ppl_en": 503.81342703946245,
+      "ppl_pl": 302.9872083873342,
+      "tok_en": 81880,
+      "win_en": 40,
+      "tok_pl": 81880,
+      "win_pl": 40,
+      "sec": 78.25040626525879
+    }
+  },
+  "deltas": {
+    "add_int4act_en_pct": 8099.46059619807,
+    "add_int4act_pl_pct": 11142.667946496998,
+    "hadamard_benefit_en_pct": -98.72972519788337,
+    "hadamard_benefit_pl_pct": -99.08144922689192
+  }
+}
