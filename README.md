@@ -6,9 +6,63 @@
 
 ---
 
+## ⚠️ READ THIS FIRST: set the GPU power level to `auto` — or your RDNA4 card runs SLOW
+
+**This is the single most common RDNA4 misconfiguration, and almost nobody knows it.** If "RDNA4 is slow for inference" — 9 times out of 10 it's *this*, not the hardware. Most people set a `high` / `profile_peak` "performance" profile thinking it makes the card faster. **It does the opposite: it PINS the GPU to a LOWER fixed clock and disables the boost governor.**
+
+```bash
+# ✅ CORRECT — lets the boost governor run; the card clocks UP under load
+rocm-smi --setperflevel auto
+
+# ❌ WRONG — these LOCK a fixed ~2326 MHz; the card never boosts
+rocm-smi --setperflevel high            # pins low
+rocm-smi --setperflevel profile_peak    # pins low  (also throttles to a fixed clock)
+#   ...and any manual sclk lock does the same
+```
+
+### Measured on R9700 (Navi 48, gfx1201, 64 CU), this repo:
+
+| Perf level | sclk under load | Effect |
+|---|---:|---|
+| `high` / `profile_peak` / manual | **2326 MHz (PINNED)** | governor off → stuck low → **~20–25 % slower** |
+| **`auto`** (heavy GEMM, ~300 W power-capped) | **~2890 MHz sustained** | **+24 % clock vs pinned** |
+| `auto` (light / compute-bound, ~90 W) | **up to 3491–3494 MHz** | the card's true max DPM state |
+
+The clock is **inversely tied to load intensity** — it is *power*-limited, not glitched: a light/bursty kernel with parked memory boosts to ~3490 MHz at ~90 W, while an ALU-saturating GEMM settles at ~2890 MHz at the ~300 W TBP. Both are real silicon DPM states (the max table entry reads 3491 MHz). **`profile_peak`/`high` throws all of this away by pinning 2326 MHz.**
+
+### Always benchmark with `auto`
+Every number in this repo was measured with `rocm-smi --setperflevel auto`. Benchmarking under `high`/`profile_peak` measures a throttled card (~20–25 % low). Verify your *live, under-load* clock — idle readings are meaningless:
+
+```bash
+rocm-smi --showclocks    # watch the sclk line WHILE a workload runs
+```
+
+### Related power traps that also silently slow the card
+- **PCIe D3hot throttle:** the R9700 down-clocks when the slot enters the D3hot power state. Force it on: `echo on | sudo tee /sys/bus/pci/devices/<BDF>/power/control` (make it a systemd service — it resets on reboot).
+- **PCIe ASPM:** setting the policy to `performance` gave **+10.8 % dense decode** on RADV here (also resets on reboot).
+
+> **Bottom line:** fix the perf level *before* you benchmark or conclude anything about RDNA4 speed. A pinned 2326 MHz card looks ~25 % slower than the exact same silicon on `auto`.
+
+---
+
 ## Key Results
 
-**GPU:** AMD Radeon AI PRO R9700 (RDNA4, gfx1201, 32 GB, 576 GB/s)
+**GPU:** AMD Radeon AI PRO R9700 (RDNA4, gfx1201, 32 GB, **640 GB/s**)
+
+### Latest: Vulkan Engine + llama.cpp Optimization (2026-03-25)
+
+| Approach | Decode tg128 | Prefill pp512 | Notes |
+|----------|----------:|----------:|-------|
+| **Custom Vulkan engine** | **244 t/s** | 4103 t/s (GEMM) | Pre-recorded cmd buf, text bug in flash attn |
+| **llama.cpp RADV 25.2.8 + gfx queue** | **196.5 t/s** | 2202 t/s | Best correct-output decode |
+| llama.cpp RADV 25.3.6 | 182 t/s | **3096 t/s** | Best prefill, ACO decode regressed |
+| llama.cpp AMDVLK | 193 t/s | 2070 t/s | AMDVLK discontinued |
+
+**Key findings (RDNA4 gfx1201):**
+- Graphics queue (`GGML_VK_ALLOW_GRAPHICS_QUEUE=1`) = **+3% decode** on RADV
+- System Mesa 25.2.8 = +7% decode vs custom 25.3.6/26.0.3 (ACO compiler regression)
+- RDNA4: no L1 cache, wave32 native, 64KB LDS, WMMA INT4 16x16x32, VOPD dual-issue
+- Custom Vulkan engine: 477 GB/s (75% peak), 9 shaders validated vs PyTorch
 
 ### Qwen3-14B (Dense, 40 layers)
 
